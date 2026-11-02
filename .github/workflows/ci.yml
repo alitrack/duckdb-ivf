@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Build every platform; e2e-test where the artifact matches the runner arch.
+# Unlike tiktoken, the e2e host is the `duckdb` PYTHON package (a pip wheel),
+# so tests need no embedded C++ DuckDB build — but we still keep the same
+# matrix as tiktoken for artifact coverage:
+# - osx_amd64 is CROSS-compiled on the arm64 macos-latest runner, so its
+#   artifact can't be dlopened on the host (test skipped).
+# - windows_amd64 builds are artifact-only for now (no make preinstalled; the
+#   e2e host would work there, enable when the Windows toolchain step lands).
+jobs:
+  build:
+    name: Build & test (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux_amd64
+            test: true
+          - os: macos-latest
+            platform: osx_arm64
+            test: true
+          - os: macos-latest
+            platform: osx_amd64
+            test: false
+          - os: windows-latest
+            platform: windows_amd64
+            test: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # osx_amd64 cross-builds need the x86_64 std; no-op elsewhere.
+          targets: ${{ matrix.platform == 'osx_amd64' && 'x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install build tools
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install make -y
+
+      - name: Configure (venv, platform, version)
+        shell: bash
+        run: make configure DUCKDB_PLATFORM=${{ matrix.platform }}
+
+      - name: Build + stamp metadata
+        shell: bash
+        run: make release DUCKDB_PLATFORM=${{ matrix.platform }}
+
+      - name: Install e2e host (duckdb python package)
+        if: matrix.test
+        shell: bash
+        run: pip install duckdb
+
+      - name: Test (SQL e2e against the stamped artifact)
+        if: matrix.test
+        shell: bash
+        run: make test
+
+      - name: Verify artifact
+        shell: bash
+        run: |
+          ls -la build/release/vss.duckdb_extension
+          file build/release/vss.duckdb_extension
