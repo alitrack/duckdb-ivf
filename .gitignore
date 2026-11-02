@@ -1,0 +1,7 @@
+target/
+build/
+configure/
+*.duckdb_extension
+*.so
+*.dylib
+e2e_final.out

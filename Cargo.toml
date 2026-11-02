@@ -1,0 +1,41 @@
+[package]
+name = "duckdb-vss"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+description = "DuckDB loadable extension: IVF-Flat approximate nearest-neighbor vector search in pure Rust (quack-rs C-API binding layer; no VGI, no Arrow IPC, zero runtime deps)"
+
+[lib]
+name = "vss"
+crate-type = ["cdylib"]
+
+# Packaging tool (copied from quack-rs, std-only): stamps the 534-byte DuckDB
+# extension metadata footer onto the built cdylib to produce the loadable
+# .duckdb_extension. `cargo run --bin append_metadata`.
+[[bin]]
+name = "append_metadata"
+path = "src-bin/append_metadata/main.rs"
+
+[dependencies]
+# quack-rs — pure-Rust wrapper over DuckDB's C Extension API (crates.io).
+# Pinned exactly so the reviewed ABI-wrapper version can never float.
+quack-rs = "=0.18.0"
+# C extension API headers/symbols; the cdylib resolves them against the host
+# DuckDB process at LOAD time.
+libduckdb-sys = { version = "1.10504", features = ["loadable-extension"] }
+
+[dev-dependencies]
+# (none) — the SQL-level e2e harness (tests/run_sql_tests.py) uses the `duckdb`
+# PYTHON package as its host, installed by the CI workflow / `make test`. No
+# embedded C++ DuckDB build needed, so no `duckdb` crate here.
+
+[profile.release]
+# `unwind`, not `abort`: every callback is wrapped in quack-rs's
+# panic-safe `*_callback!` macros (catch_unwind -> set_error), so a panic in
+# extension code becomes a DuckDB error instead of aborting the host process.
+panic = "unwind"
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
