@@ -2,8 +2,8 @@
 # Required by extension-ci-tools even for pure-Rust (cargo) extensions.
 # See: https://github.com/duckdb/extension-ci-tools
 
-duckdb_extension_load(tiktoken
+duckdb_extension_load(ivf
 	LOAD_TESTS
-	GIT_URL https://github.com/alitrack/duckdb-tiktoken
+	GIT_URL https://github.com/alitrack/duckdb-ivf
 	GIT_TAG main
 )

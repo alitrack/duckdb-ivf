@@ -82,5 +82,5 @@ jobs:
       - name: Verify artifact
         shell: bash
         run: |
-          ls -la build/release/vss.duckdb_extension
-          file build/release/vss.duckdb_extension
+          ls -la build/release/ivf.duckdb_extension
+          file build/release/ivf.duckdb_extension

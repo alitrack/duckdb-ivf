@@ -1,28 +1,28 @@
 //! DuckDB loadable extension: IVF-Flat approximate nearest-neighbor vector search.
 //!
-//! Pure-Rust IVF index (see [`vss`]) exposed through the quack-rs C Extension API.
+//! Pure-Rust IVF index (see [`ivf`]) exposed through the quack-rs C Extension API.
 //! No ANN index exists in DuckDB core (only brute-force `list_distance`), so this
 //! is the sublinear-ANN gap; it complements the `fts` extension's BM25 (hybrid =
 //! RRF over both, see the companion `hybrid_search.sql` macro layer).
 //!
 //! Function surface:
 //!
-//!   vss_create_index(name, table, id_column, vector_column, nlist, niter, normalize)
+//!   ivf_create_index(name, table, id_column, vector_column, nlist, niter, normalize)
 //!       -> BIGINT   (rows indexed; trains an IVF index over `vector_column`)
-//!   vss_search(name, query_table, query_column, top_k, nprobe)
+//!   ivf_search(name, query_table, query_column, top_k, nprobe)
 //!       -> table(id BIGINT, score DOUBLE)   (ANN: probe nprobe nearest lists)
-//!   vss_search_exact(name, query_table, query_column, top_k)
+//!   ivf_search_exact(name, query_table, query_column, top_k)
 //!       -> table(id BIGINT, score DOUBLE)   (brute force; recall baseline)
-//!   vss_list()
+//!   ivf_list()
 //!       -> table(name VARCHAR, dim INT, n BIGINT, nlist INT)
-//!   vss_version() -> VARCHAR
+//!   ivf_version() -> VARCHAR
 //!
 //! Conventions:
 //!   * `vector_column` must be `FLOAT[d]` (a LIST of FLOAT). `normalize=true`
 //!     L2-normalizes every vector at build time, so score = cosine similarity.
 //!   * the query vector is read from a single-row table (`query_table`) via
 //!     `query_column`; it must have the same dimension as the index.
-//!   * `nprobe == nlist` makes `vss_search` exhaustive (recall 1.0); smaller
+//!   * `nprobe == nlist` makes `ivf_search` exhaustive (recall 1.0); smaller
 //!     `nprobe` trades recall for speed.
 //!
 //! C-API constraint (inherited from every quack-rs extension): table/scalar
@@ -48,8 +48,8 @@ use quack_rs::types::TypeId;
 use quack_rs::vector::complex::ListVector;
 use quack_rs::vector::{VectorReader, VectorWriter};
 
-mod vss;
-use vss::Ivf;
+mod ivf;
+use ivf::Ivf;
 
 const VERSION: &str = "0.1.0";
 const DEFAULT_SEED: u64 = 0x5EED_5EED_0BAD_5EED;
@@ -89,14 +89,14 @@ impl SessionError {
     fn message(&self) -> &'static str {
         match self {
             Self::Reentrant => {
-                "vss: nested vss call detected (a view or table function is calling vss \
-                 while another vss call is executing on this thread); not supported"
+                "ivf: nested ivf call detected (a view or table function is calling ivf \
+                 while another ivf call is executing on this thread); not supported"
             }
             Self::MultiDb => {
-                "vss: the extension was loaded on more than one database in this process; \
+                "ivf: the extension was loaded on more than one database in this process; \
                  v0.1 supports a single database instance"
             }
-            Self::Unavailable => "vss: the extension session is unavailable",
+            Self::Unavailable => "ivf: the extension session is unavailable",
         }
     }
 }
@@ -187,7 +187,7 @@ unsafe fn read_list_f32(chunk: &DataChunk, col: usize, row: usize, out: &mut Vec
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Table function: vss_create_index(name, table, id_column, vector_column, nlist, niter, normalize)
+// Table function: ivf_create_index(name, table, id_column, vector_column, nlist, niter, normalize)
 //   -> (rows_indexed BIGINT)
 //
 // A TABLE function, not a scalar: this is a side-effectful function that runs a nested
@@ -265,7 +265,7 @@ fn do_create_index(b: &CreateBind) -> Result<i64, String> {
                         None => dim = Some(len),
                         Some(dm) if len != dm => {
                             return Err(format!(
-                                "vss_create_index: ragged vectors (dim {} vs {}); use a fixed-length FLOAT[{}]",
+                                "ivf_create_index: ragged vectors (dim {} vs {}); use a fixed-length FLOAT[{}]",
                                 len, dm, dm
                             ));
                         }
@@ -276,22 +276,22 @@ fn do_create_index(b: &CreateBind) -> Result<i64, String> {
                 }
             }
             Ok(None) => break,
-            Err(e) => return Err(format!("vss_create_index: {e}")),
+            Err(e) => return Err(format!("ivf_create_index: {e}")),
         }
     }
     let n = ids.len();
     if n == 0 {
-        return Err("vss_create_index: no rows to index".into());
+        return Err("ivf_create_index: no rows to index".into());
     }
-    let d = dim.ok_or("vss_create_index: no vectors")?;
+    let d = dim.ok_or("ivf_create_index: no vectors")?;
     if d == 0 {
-        return Err("vss_create_index: first vector is empty".into());
+        return Err("ivf_create_index: first vector is empty".into());
     }
     let default_nlist = (n as f64).sqrt() as usize;
     let nlist = (if b.nlist == 0 { default_nlist } else { b.nlist }).clamp(1, 4096);
     let niter = if b.niter == 0 { 16 } else { b.niter };
     let ivf = Ivf::train(&data, d, nlist, niter, b.normalize, DEFAULT_SEED)
-        .map_err(|e| format!("vss_create_index: {e}"))?;
+        .map_err(|e| format!("ivf_create_index: {e}"))?;
     let mut reg = INDEXES.lock().unwrap();
     reg.insert(b.name.clone(), VssIndex { ivf, ids });
     Ok(n as i64)
@@ -308,19 +308,19 @@ quack_rs::table_bind_callback!(create_index_bind, |info| {
         let niter = bind_info.get_parameter_value(5).as_i64().unwrap_or(0) as usize;
         let normalize = bind_info.get_parameter_value(6).as_bool().unwrap_or(true);
         if name.is_empty() {
-            bind_info.set_error("vss_create_index: name must be non-empty");
+            bind_info.set_error("ivf_create_index: name must be non-empty");
             return;
         }
         if !is_safe_identifier(&table) {
-            bind_info.set_error("vss_create_index: table must be an identifier (e.g. 'main.docs')");
+            bind_info.set_error("ivf_create_index: table must be an identifier (e.g. 'main.docs')");
             return;
         }
         if !is_safe_identifier(&vec_col) {
-            bind_info.set_error("vss_create_index: vector_column must be an identifier");
+            bind_info.set_error("ivf_create_index: vector_column must be an identifier");
             return;
         }
         if !id_col.is_empty() && !is_safe_identifier(&id_col) {
-            bind_info.set_error("vss_create_index: id_column must be an identifier or empty");
+            bind_info.set_error("ivf_create_index: id_column must be an identifier or empty");
             return;
         }
         bind_info
@@ -388,7 +388,7 @@ struct SearchState {
 fn read_query_vector(sess: &SessionConn, query_table: &str, query_column: &str)
     -> Result<Vec<f32>, String>
 {
-    // Same physical-materialization normalization as vss_create_index: a query
+    // Same physical-materialization normalization as ivf_create_index: a query
     // table with DOUBLE[] (or FLOAT[N]) must be converted elementwise to
     // variable-length LIST(FLOAT), or the C-API child reader misreads f64 as f32.
     let sql = format!(
@@ -414,7 +414,7 @@ fn do_search(b: &SearchBind) -> Result<Vec<(i64, f32)>, String> {
     }?;
 
     let guard = INDEXES.lock().unwrap();
-    let idx = guard.get(&b.name).ok_or_else(|| format!("no vss index named '{}' — call vss_create_index first", b.name))?;
+    let idx = guard.get(&b.name).ok_or_else(|| format!("no ivf index named '{}' — call ivf_create_index first", b.name))?;
     if idx.ivf.dim != query.len() {
         return Err(format!("query dim {} != index dim {}", query.len(), idx.ivf.dim));
     }
@@ -429,7 +429,7 @@ fn do_search(b: &SearchBind) -> Result<Vec<(i64, f32)>, String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Table function: vss_search / vss_search_exact
+// Table function: ivf_search / ivf_search_exact
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn bind_search(info: libduckdb_sys::duckdb_bind_info, exact: bool) {
@@ -440,7 +440,7 @@ fn bind_search(info: libduckdb_sys::duckdb_bind_info, exact: bool) {
         let query_column = bind_info.get_parameter_value(2).as_str().unwrap_or_default().trim().to_string();
         let top_k = match bind_info.get_named_parameter_value("top_k").as_i64() {
             Some(v) if (1..=1_000_000).contains(&v) => v,
-            Some(v) => { bind_info.set_error(&format!("vss_search: top_k must be 1..=1000000 (got {v})")); return; }
+            Some(v) => { bind_info.set_error(&format!("ivf_search: top_k must be 1..=1000000 (got {v})")); return; }
             None => 10,
         };
         let nprobe = match bind_info.get_named_parameter_value("nprobe").as_i64() {
@@ -448,11 +448,11 @@ fn bind_search(info: libduckdb_sys::duckdb_bind_info, exact: bool) {
             None => 0,
         };
         if !is_safe_identifier(&query_table) {
-            bind_info.set_error("vss_search: query_table must be an identifier");
+            bind_info.set_error("ivf_search: query_table must be an identifier");
             return;
         }
         if !is_safe_identifier(&query_column) {
-            bind_info.set_error("vss_search: query_column must be an identifier");
+            bind_info.set_error("ivf_search: query_column must be an identifier");
             return;
         }
         // Probe: the index must exist and the query table must be readable.
@@ -460,13 +460,13 @@ fn bind_search(info: libduckdb_sys::duckdb_bind_info, exact: bool) {
             Ok(sess) => {
                 let guard = INDEXES.lock().unwrap();
                 if !guard.contains_key(&name) {
-                    bind_info.set_error(&format!("no vss index named '{}' — call vss_create_index first", name));
+                    bind_info.set_error(&format!("no ivf index named '{}' — call ivf_create_index first", name));
                     return;
                 }
                 drop(guard);
                 let probe = format!("SELECT {query_column} FROM {query_table} LIMIT 0");
                 if let Err(e) = sess.con.query(&probe) {
-                    bind_info.set_error(&format!("vss_search: cannot read query_table '{query_table}': {e}"));
+                    bind_info.set_error(&format!("ivf_search: cannot read query_table '{query_table}': {e}"));
                     return;
                 }
             }
@@ -528,7 +528,7 @@ quack_rs::table_scan_callback!(search_scan, |info, output| {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Table function: vss_list()
+// Table function: ivf_list()
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct ListState {
@@ -536,7 +536,7 @@ struct ListState {
     next: usize,
 }
 
-quack_rs::table_bind_callback!(vss_list_bind, |info| {
+quack_rs::table_bind_callback!(ivf_list_bind, |info| {
     unsafe {
         let bind_info = BindInfo::new(info);
         let n = INDEXES.lock().unwrap().len();
@@ -549,7 +549,7 @@ quack_rs::table_bind_callback!(vss_list_bind, |info| {
     }
 });
 
-quack_rs::table_init_callback!(vss_list_init, |info| {
+quack_rs::table_init_callback!(ivf_list_init, |info| {
     unsafe {
         InitInfo::new(info).set_max_threads(1);
         let guard = INDEXES.lock().unwrap();
@@ -561,7 +561,7 @@ quack_rs::table_init_callback!(vss_list_init, |info| {
     }
 });
 
-quack_rs::table_scan_callback!(vss_list_scan, |info, output| {
+quack_rs::table_scan_callback!(ivf_list_scan, |info, output| {
     unsafe {
         let chunk = DataChunk::from_raw(output);
         let Some(state) = FfiInitData::<ListState>::get_mut(info) else {
@@ -586,7 +586,7 @@ quack_rs::table_scan_callback!(vss_list_scan, |info, output| {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Scalar: vss_version()
+// Scalar: ivf_version()
 // ─────────────────────────────────────────────────────────────────────────────
 
 quack_rs::scalar_callback!(version_fn, |_info, _input, output| {
@@ -624,7 +624,7 @@ unsafe fn register_all(con: &Connection) -> Result<(), ExtensionError> {
     }
 
     con.register_table(
-        TableFunctionBuilder::new("vss_create_index")
+        TableFunctionBuilder::new("ivf_create_index")
             .param(TypeId::Varchar)
             .param(TypeId::Varchar)
             .param(TypeId::Varchar)
@@ -638,7 +638,7 @@ unsafe fn register_all(con: &Connection) -> Result<(), ExtensionError> {
     )?;
 
     con.register_table(
-        TableFunctionBuilder::new("vss_search")
+        TableFunctionBuilder::new("ivf_search")
             .param(TypeId::Varchar)
             .param(TypeId::Varchar)
             .param(TypeId::Varchar)
@@ -650,7 +650,7 @@ unsafe fn register_all(con: &Connection) -> Result<(), ExtensionError> {
     )?;
 
     con.register_table(
-        TableFunctionBuilder::new("vss_search_exact")
+        TableFunctionBuilder::new("ivf_search_exact")
             .param(TypeId::Varchar)
             .param(TypeId::Varchar)
             .param(TypeId::Varchar)
@@ -661,14 +661,14 @@ unsafe fn register_all(con: &Connection) -> Result<(), ExtensionError> {
     )?;
 
     con.register_table(
-        TableFunctionBuilder::new("vss_list")
-            .bind(vss_list_bind)
-            .init(vss_list_init)
-            .scan(vss_list_scan),
+        TableFunctionBuilder::new("ivf_list")
+            .bind(ivf_list_bind)
+            .init(ivf_list_init)
+            .scan(ivf_list_scan),
     )?;
 
     con.register_scalar(
-        ScalarFunctionBuilder::new("vss_version")
+        ScalarFunctionBuilder::new("ivf_version")
             .returns(TypeId::Varchar)
             .function(version_fn),
     )?;
@@ -676,4 +676,4 @@ unsafe fn register_all(con: &Connection) -> Result<(), ExtensionError> {
     Ok(())
 }
 
-quack_rs::entry_point_v2!(vss_init_c_api, |con| register_all(con));
+quack_rs::entry_point_v2!(ivf_init_c_api, |con| register_all(con));

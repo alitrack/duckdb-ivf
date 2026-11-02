@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end test of the duckdb-vss IVF extension on ag_news bge-m3 embeddings.
+"""End-to-end test of the duckdb-ivf IVF extension on ag_news bge-m3 embeddings.
 Load .so -> load into in-memory DB -> build IVF index -> ANN vs brute-force recall.
 This is the acceptance test for the Rust extension (b).
 """
@@ -8,15 +8,15 @@ import numpy as np
 import duckdb
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SO = "/home/lhy/vss-target/release/libvss.so"
-NPZ = "/mnt/d/wsl2/tmp/fts_vss_poc/emb_bge_m3.npz"
+SO = "/home/lhy/ivf-target/release/libivf.so"
+NPZ = "/mnt/d/wsl2/tmp/fts_ivf_poc/emb_bge_m3.npz"
 PARQUET = "/mnt/d/wsl2/ag_news_data/ag_news_train.parquet"
 
 con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
 # DuckDB 2.0 requires loadables named *.duckdb_extension with a 512-byte metadata
 # footer. Stamp it on the C-API .so (C_STRUCT ABI, C-API-min v1.2.0, linux_amd64,
 # magic "4") — same layout tiktoken's build produces.
-EXT = "/home/lhy/vss-target/release/vss.duckdb_extension"
+EXT = "/home/lhy/ivf-target/release/ivf.duckdb_extension"
 def stamp(src, dst, ext_ver="v0.1.0", db_ver="v1.2.0", plat="linux_amd64"):
     data = open(src, "rb").read()
     if data[-512:-480].split(b"\x00")[0] == b"4":  # already stamped
@@ -43,11 +43,11 @@ print("table news_vec built, rows =", con.sql("SELECT count(*) FROM news_vec").f
 
 # Train IVF index inside the DB (nlist=sqrt(N) default, niter=10).
 t0 = time.time()
-res = con.sql("SELECT rows_indexed FROM vss_create_index('news', 'news_vec', 'id', 'vec', 350, 10, true)").fetchall()
+res = con.sql("SELECT rows_indexed FROM ivf_create_index('news', 'news_vec', 'id', 'vec', 350, 10, true)").fetchall()
 train_s = time.time() - t0
-print(f"vss_create_index -> {res}  ({train_s:.1f}s to train)")
+print(f"ivf_create_index -> {res}  ({train_s:.1f}s to train)")
 
-print("\nvss_list():", con.sql("SELECT * FROM vss_list()").fetchall())
+print("\nivf_list():", con.sql("SELECT * FROM ivf_list()").fetchall())
 
 # Build a held-out query set: 50 random docs as queries.
 rng = np.random.default_rng(0)
@@ -68,18 +68,18 @@ for i, qi in enumerate(qidx):
     con.execute("CREATE OR REPLACE TABLE q1 AS SELECT vec FROM q1_src")
     con.unregister("q1_src")
     t0 = time.time()
-    ann = con.sql("SELECT id, score FROM vss_search('news','q1','vec', top_k:=50)").fetchall()
+    ann = con.sql("SELECT id, score FROM ivf_search('news','q1','vec', top_k:=50)").fetchall()
     ann_ms.append((time.time()-t0)*1000)
     ann_ids = [a[0] for a in ann]
     t0 = time.time()
-    ex = con.sql("SELECT id FROM vss_search_exact('news','q1','vec', top_k:=50)").fetchall()
+    ex = con.sql("SELECT id FROM ivf_search_exact('news','q1','vec', top_k:=50)").fetchall()
     exact_ms.append((time.time()-t0)*1000)
     ex_ids = [e[0] for e in ex]
     bf = set(brute_force(q).tolist())
     for k in recall:
         recall[k].append(len(set(ann_ids[:k]) & bf) / k)
 
-print("\n=== vss_search (IVF ANN) recall vs brute-force ground truth ===")
+print("\n=== ivf_search (IVF ANN) recall vs brute-force ground truth ===")
 for k in recall:
     print(f"  recall@{k:<2} = {np.mean(recall[k]):.4f}")
 print(f"  ANN  median = {np.median(ann_ms):.2f} ms   (50 queries)")
@@ -92,7 +92,7 @@ agree = len(top10_ann & top10_ex) / 10
 print(f"  last-query ANN top10 ∩ exact top10 = {agree:.2f}")
 
 # A real end-to-end example query.
-print("\n=== example: vss_search top-3 for query doc", int(qidx[0]), "===")
+print("\n=== example: ivf_search top-3 for query doc", int(qidx[0]), "===")
 for r in ann[:3]:
     print(f"  id={r[0]:>7}  score={r[1]:.5f}")
 
@@ -110,7 +110,7 @@ for np_ in (8, 16, 32, 64, 128, 350):
         con.execute("CREATE OR REPLACE TABLE q1 AS SELECT vec FROM q1_src")
         con.unregister("q1_src")
         t0 = time.time()
-        rows = con.sql(f"SELECT id FROM vss_search('news','q1','vec', top_k:=10, nprobe:={np_})").fetchall()
+        rows = con.sql(f"SELECT id FROM ivf_search('news','q1','vec', top_k:=10, nprobe:={np_})").fetchall()
         times.append((time.time() - t0) * 1000)
         got10 = set(r[0] for r in rows)
         bf1 = np.argsort(-d @ q)[0]

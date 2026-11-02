@@ -1,12 +1,12 @@
-# duckdb-vss
+# duckdb-ivf
 
 DuckDB loadable extension: **IVF-Flat approximate nearest-neighbor vector search** in pure Rust.
 
-This is the (b) deliverable of the SereneDB feasibility study (`D:\wsl2\tmp\fts_vss_poc`).
-The study's conclusion: DuckDB's `fts` + `vss` extensions + SQL-layer RRF hybrid can reproduce
+This is the (b) deliverable of the SereneDB feasibility study (`D:\wsl2\tmp\fts_ivf_poc`).
+The study's conclusion: DuckDB's `fts` + `ivf` extensions + SQL-layer RRF hybrid can reproduce
 ~80–90% of SereneDB's *functional* surface. The one thing DuckDB **core genuinely lacks** is a
 vector **index** — core's `list_distance` is brute-force kNN, and this build has no HNSW/IVF/VSS
-index type. `duckdb-vss` fills exactly that gap: a real, in-DB ANN index you create and query from SQL.
+index type. `duckdb-ivf` fills exactly that gap: a real, in-DB ANN index you create and query from SQL.
 
 > Honest framing: this is a **reusable skeleton with a working data plane**, not a production
 > vector engine. Training is single-threaded k-means (no SIMD, no persistence, no parallel build).
@@ -26,11 +26,11 @@ index type. `duckdb-vss` fills exactly that gap: a real, in-DB ANN index you cre
 
 | Function | Kind | Description |
 |---|---|---|
-| `vss_create_index(name, table, id_column, vector_column, nlist, niter, normalize)` | table | Train + register an IVF index over a table's vector column. Returns 1 row `(rows_indexed BIGINT)`. |
-| `vss_search(name, query_table, query_column, top_k := 10, nprobe := 0)` | table | Approximate search. Returns `(id BIGINT, score DOUBLE)` for the top-k. |
-| `vss_search_exact(name, query_table, query_column, top_k := 10)` | table | Exhaustive ground-truth search (brute force over all `n`). |
-| `vss_list()` | table | List registered indexes: `(name, dim, n, nlist)`. |
-| `vss_version()` | scalar | Extension version. |
+| `ivf_create_index(name, table, id_column, vector_column, nlist, niter, normalize)` | table | Train + register an IVF index over a table's vector column. Returns 1 row `(rows_indexed BIGINT)`. |
+| `ivf_search(name, query_table, query_column, top_k := 10, nprobe := 0)` | table | Approximate search. Returns `(id BIGINT, score DOUBLE)` for the top-k. |
+| `ivf_search_exact(name, query_table, query_column, top_k := 10)` | table | Exhaustive ground-truth search (brute force over all `n`). |
+| `ivf_list()` | table | List registered indexes: `(name, dim, n, nlist)`. |
+| `ivf_version()` | scalar | Extension version. |
 
 - `nlist = 0` → default `sqrt(n)`, clamped `[1, 4096]`.
 - `niter = 0` → 16 k-means iterations.
@@ -40,29 +40,29 @@ index type. `duckdb-vss` fills exactly that gap: a real, in-DB ANN index you cre
 ### Usage
 
 ```sql
-LOAD 'vss.duckdb_extension';
+LOAD 'ivf.duckdb_extension';
 
 -- Index the vector column (a LIST(FLOAT) or a fixed ARRAY column; the latter is
 -- auto-normalized to a LIST inside the extension).
-SELECT * FROM vss_create_index('news', 'main.news_vec', 'id', 'vec', 350, 10, true);
+SELECT * FROM ivf_create_index('news', 'main.news_vec', 'id', 'vec', 350, 10, true);
 
 -- The query vector is a 1-row table the extension can read (see the
 -- "session connection" note below).
 CREATE TABLE q1 AS SELECT [0.1, 0.2, ...] AS vec;   -- 1024 floats
 
-SELECT id, score FROM vss_search('news', 'q1', 'vec', top_k := 10, nprobe := 32);
+SELECT id, score FROM ivf_search('news', 'q1', 'vec', top_k := 10, nprobe := 32);
 ```
 
 ### Important: the session connection
 
-A C-API extension **cannot see the caller's connection**. `duckdb-vss` opens its own
+A C-API extension **cannot see the caller's connection**. `duckdb-ivf` opens its own
 *session connection* (bound to the first database that `LOAD`s it) to read the indexed
 table and the query table. Consequences:
 
 - The indexed table and the query table must be **permanent tables** (the session
   connection cannot see the caller's temp tables or `register()`ed in-memory views).
 - The index lives in a process-global registry for the process lifetime, addressed by
-  `name`. It is not persisted across DuckDB restarts (re-run `vss_create_index`).
+  `name`. It is not persisted across DuckDB restarts (re-run `ivf_create_index`).
 - Multi-database / re-entrant use is guarded (a `ReentryMark` prevents a table
   callback from running a nested query on the very connection it's scanning).
 
@@ -70,8 +70,8 @@ table and the query table. Consequences:
 
 ```bash
 # C-API extension: quack-rs 0.18.0 + libduckdb-sys (loadable). All deps offline-cached.
-CARGO_TARGET_DIR=/home/lhy/vss-target cargo build --release --lib --offline
-# → target/release/libvss.so
+CARGO_TARGET_DIR=/home/lhy/ivf-target cargo build --release --lib --offline
+# → target/release/libivf.so
 ```
 
 DuckDB 2.0 requires a 512-byte metadata footer on loadables. Stamp the `.so`:
@@ -86,16 +86,16 @@ def stamp(so, dst, ext="v0.1.0", db="v1.2.0", plat="linux_amd64"):
     open(dst, "wb").write(data + f.ljust(512, b"\x00"))
 ```
 
-Then `SET allow_unsigned_extensions=1; LOAD 'vss.duckdb_extension';`.
+Then `SET allow_unsigned_extensions=1; LOAD 'ivf.duckdb_extension';`.
 
 ## Verified (ag_news, bge-m3 120,000 × 1024, L2-normalized)
 
 `test_e2e.py` loads the extension into DuckDB 2.0.0 and (latest run, `e2e_final.out`):
 
-- `vss_create_index` trains an IVF index over all 120,000 vectors — **no crash** (157s,
+- `ivf_create_index` trains an IVF index over all 120,000 vectors — **no crash** (157s,
   single-threaded k-means, nlist=350, niter=10).
-- `vss_list()` → `(news, 1024, 120000, 350)`.
-- `vss_search` recall@1/5/10 vs a numpy brute-force ground truth = **1.000 / 1.000 / 1.000**.
+- `ivf_list()` → `(news, 1024, 120000, 350)`.
+- `ivf_search` recall@1/5/10 vs a numpy brute-force ground truth = **1.000 / 1.000 / 1.000**.
 - **nprobe sweep** (the proof it's a real ANN, not a brute-force wrapper — core
   `list_distance` always scans all `n` and has no equivalent):
 
@@ -130,7 +130,7 @@ Then `SET allow_unsigned_extensions=1; LOAD 'vss.duckdb_extension';`.
 2. **k-means centroid buffer.** `centroids` was allocated as `nlist` floats instead of
    `nlist * dim` → out-of-bounds on any non-trivial build. Fixed to `vec![0.0; nlist*dim]`.
 
-(An earlier design had `vss_create_index` as a *scalar* function; a side-effectful
+(An earlier design had `ivf_create_index` as a *scalar* function; a side-effectful
 index-building function must be a **table function** so the optimizer doesn't treat it as a
 pure constant-foldable scalar. It is now a table function.)
 
@@ -146,7 +146,7 @@ pure constant-foldable scalar. It is now a table function.)
 
 ## Files
 
-- `src/vss.rs` — pure-Rust IVF engine (k-means + search), zero deps.
+- `src/ivf.rs` — pure-Rust IVF engine (k-means + search), zero deps.
 - `src/lib.rs` — quack-rs C-API binding: 5 functions, session connection, LIST reader.
 - `test_e2e.py` — acceptance test on real ag_news bge-m3 embeddings.
 - `Makefile`, `Cargo.toml` — C-API extension build (tiktoken skeleton, zero new deps).

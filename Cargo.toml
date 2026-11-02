@@ -1,5 +1,5 @@
 [package]
-name = "duckdb-vss"
+name = "duckdb-ivf"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
@@ -7,7 +7,7 @@ license = "MIT"
 description = "DuckDB loadable extension: IVF-Flat approximate nearest-neighbor vector search in pure Rust (quack-rs C-API binding layer; no VGI, no Arrow IPC, zero runtime deps)"
 
 [lib]
-name = "vss"
+name = "ivf"
 crate-type = ["cdylib"]
 
 # Packaging tool (copied from quack-rs, std-only): stamps the 534-byte DuckDB

@@ -93,14 +93,14 @@ impl Ivf {
         seed: u64,
     ) -> Result<Self, String> {
         if dim == 0 {
-            return Err("vss: dim must be > 0".into());
+            return Err("ivf: dim must be > 0".into());
         }
         let n = data.len() / dim;
         if data.len() != n * dim {
-            return Err(format!("vss: data len {} is not a multiple of dim {}", data.len(), dim));
+            return Err(format!("ivf: data len {} is not a multiple of dim {}", data.len(), dim));
         }
         if n == 0 {
-            return Err("vss: no vectors to index".into());
+            return Err("ivf: no vectors to index".into());
         }
         let nlist = nlist.clamp(1, n);
 

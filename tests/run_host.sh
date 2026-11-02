@@ -4,7 +4,7 @@
 # Resolution order:
 #   1. `python3` (already has `duckdb` — e.g. CI after `pip install duckdb`)
 #   2. repo-local `.venv/bin/python` (uv-managed; created once per checkout)
-# Usage: bash tests/run_host.sh <path/to/vss.duckdb_extension>
+# Usage: bash tests/run_host.sh <path/to/ivf.duckdb_extension>
 set -euo pipefail
 
 ARTIFACT="$1"

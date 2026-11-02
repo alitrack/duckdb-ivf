@@ -2,7 +2,7 @@
 
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-EXTENSION_NAME=vss
+EXTENSION_NAME=ivf
 EXT_CONFIG=$(PROJ_DIR)extension_config.cmake
 
 # Set to 1 to enable Unstable API
