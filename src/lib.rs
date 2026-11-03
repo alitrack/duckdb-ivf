@@ -16,6 +16,15 @@
 //!   ivf_list()
 //!       -> table(name VARCHAR, dim INT, n BIGINT, nlist INT)
 //!   ivf_version() -> VARCHAR
+//!   ivf_levenshtein(a, b)            -> INTEGER  (OSA edit distance, saturated at 3)
+//!   ivf_levenshtein(a, b, maxd)      -> INTEGER  (saturated at maxd)
+//!
+//! `ivf_levenshtein` is the building block for Meilisearch-style typo
+//! tolerance on top of the `fts` extension: the macro layer in
+//! `test/fts_typo.sql` expands a query word to its closest
+//! `fts_main_<T>.raw_dict` term within a length-tiered edit budget
+//! (transpositions cost 1, so "sahcin"->"sachin" is corrected where plain
+//! Levenshtein would need 2).
 //!
 //! Conventions:
 //!   * `vector_column` must be `FLOAT[d]` (a LIST of FLOAT). `normalize=true`
@@ -42,7 +51,7 @@ use quack_rs::connection::{Connection, Registrar};
 use quack_rs::data_chunk::DataChunk;
 use quack_rs::error::ExtensionError;
 use quack_rs::query::OwnedConnection;
-use quack_rs::scalar::{ScalarFunctionBuilder, ScalarFunctionInfo};
+use quack_rs::scalar::{ScalarFunctionBuilder, ScalarFunctionInfo, ScalarFunctionSetBuilder, ScalarOverloadBuilder};
 use quack_rs::table::{BindInfo, FfiBindData, FfiInitData, InitInfo, TableFunctionBuilder};
 use quack_rs::types::TypeId;
 use quack_rs::vector::complex::ListVector;
@@ -50,6 +59,7 @@ use quack_rs::vector::{VectorReader, VectorWriter};
 
 mod ivf;
 use ivf::Ivf;
+mod lev;
 
 const VERSION: &str = "0.1.0";
 const DEFAULT_SEED: u64 = 0x5EED_5EED_0BAD_5EED;
@@ -596,6 +606,46 @@ quack_rs::scalar_callback!(version_fn, |_info, _input, output| {
     }
 });
 
+// ivf_levenshtein(a, b) — saturated at 3 (typo tiers: 0 exact / 1 / 2 / >2)
+quack_rs::scalar_callback!(lev_2_fn, |info, input, output| {
+    unsafe {
+        let a = VectorReader::new(input, 0);
+        let b = VectorReader::new(input, 1);
+        let n = a.row_count();
+        let mut writer = VectorWriter::new(output);
+        for row in 0..n {
+            if !a.is_valid(row) || !b.is_valid(row) {
+                writer.set_null(row);
+                continue;
+            }
+            let d = lev::levenshtein_bounded(a.read_str(row), b.read_str(row), 3);
+            writer.write_i32(row, d as i32);
+        }
+        let _ = info;
+    }
+});
+
+// ivf_levenshtein(a, b, maxd) — caller-chosen saturation
+quack_rs::scalar_callback!(lev_3_fn, |info, input, output| {
+    unsafe {
+        let a = VectorReader::new(input, 0);
+        let b = VectorReader::new(input, 1);
+        let md = VectorReader::new(input, 2);
+        let n = a.row_count();
+        let mut writer = VectorWriter::new(output);
+        for row in 0..n {
+            if !a.is_valid(row) || !b.is_valid(row) || !md.is_valid(row) {
+                writer.set_null(row);
+                continue;
+            }
+            let maxd = (md.read_i32(row) as usize).max(1).min(64);
+            let d = lev::levenshtein_bounded(a.read_str(row), b.read_str(row), maxd);
+            writer.write_i32(row, d as i32);
+        }
+        let _ = info;
+    }
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Registration
 // ─────────────────────────────────────────────────────────────────────────────
@@ -671,6 +721,28 @@ unsafe fn register_all(con: &Connection) -> Result<(), ExtensionError> {
         ScalarFunctionBuilder::new("ivf_version")
             .returns(TypeId::Varchar)
             .function(version_fn),
+    )?;
+
+    // ivf_levenshtein(a, b)            -> INTEGER, saturated at 3
+    // ivf_levenshtein(a, b, maxd)      -> INTEGER, saturated at maxd
+    // (Meilisearch-style typo tiers: exact=0, 1-typo, 2-typo; >2 = not a typo)
+    con.register_scalar_set(
+        ScalarFunctionSetBuilder::new("ivf_levenshtein")
+            .overload(
+                ScalarOverloadBuilder::new()
+                    .param(TypeId::Varchar)
+                    .param(TypeId::Varchar)
+                    .returns(TypeId::Integer)
+                    .function(lev_2_fn),
+            )
+            .overload(
+                ScalarOverloadBuilder::new()
+                    .param(TypeId::Varchar)
+                    .param(TypeId::Varchar)
+                    .param(TypeId::Integer)
+                    .returns(TypeId::Integer)
+                    .function(lev_3_fn),
+            ),
     )?;
 
     Ok(())

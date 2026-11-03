@@ -100,4 +100,17 @@ except duckdb.Error as e:
     assert "no ivf index" in str(e), f"expected unknown-index error, got: {e}"
 print("[ok] dim-mismatch + unknown-index surface as clean DuckDB errors")
 
+# ── 8. ivf_levenshtein: OSA distance + saturation + NULL semantics ────────
+# (feeds the fts typo-tolerance macro layer in test/fts_typo.sql)
+lv = con.execute("""
+SELECT ivf_levenshtein('crude', 'crude'),      -- exact
+       ivf_levenshtein('cruide', 'crude'),     -- 1 insertion
+       ivf_levenshtein('sahcin', 'sachin'),    -- transposition = 1 (OSA)
+       ivf_levenshtein('cruad', 'crude'),      -- 2 edits
+       ivf_levenshtein('kitten', 'sitting', 1),-- real 3, saturated at 1
+       ivf_levenshtein(NULL, 'oil')            -- NULL propagates
+""").fetchone()
+assert lv == (0, 1, 1, 2, 1, None), f"ivf_levenshtein wrong: {lv}"
+print("[ok] ivf_levenshtein: exact/insertion/transposition-1/saturation/NULL")
+
 print("\nALL e2e CHECKS PASSED")
