@@ -31,6 +31,7 @@ index type. `duckdb-ivf` fills exactly that gap: a real, in-DB ANN index you cre
 | `ivf_search_exact(name, query_table, query_column, top_k := 10)` | table | Exhaustive ground-truth search (brute force over all `n`). |
 | `ivf_list()` | table | List registered indexes: `(name, dim, n, nlist)`. |
 | `ivf_version()` | scalar | Extension version. |
+| `ivf_levenshtein(a, b)` / `(a, b, maxd)` | scalar | OSA Damerau-Levenshtein edit distance (transposition = 1), saturated at 3 / `maxd`. Building block for the fts typo-tolerance macro layer, see [Typo tolerance](#typo-tolerance--synonyms-meilisearch-style-on-top-of-fts). |
 
 - `nlist = 0` → default `sqrt(n)`, clamped `[1, 4096]`.
 - `niter = 0` → 16 k-means iterations.
@@ -120,6 +121,51 @@ Then `SET allow_unsigned_extensions=1; LOAD 'ivf.duckdb_extension';`.
 - This does **not** claim IVF beats core's vectorized brute-force at 120k — that's a separate
   performance question a single-threaded skeleton isn't positioned to answer. The claim is:
   the *tunable (speed, recall) knob* exists in-DB, and core has no equivalent.
+
+## Typo tolerance + synonyms (Meilisearch-style, on top of `fts`)
+
+`ivf_levenshtein(a, b[, maxd])` — scalar, **OSA Damerau-Levenshtein** (an
+adjacent transposition costs 1, the dominant human typo class — `sahcin`→
+`sachin`), banded with max-distance early exit, UTF-8.
+
+`test/fts_typo.sql` (v1, **recommended**) is a SQL macro layer that turns any
+layered-`fts` index into a typo-tolerant search. For table `T` with fts schema
+`fts_main_<T>`:
+
+```sql
+LOAD 'ivf.duckdb_extension';
+CREATE TABLE synonyms (a VARCHAR, b VARCHAR);  -- optional, exact, both directions
+-- register the macros from test/fts_typo.sql (they reference fts_main_<T>)
+SELECT * FROM fts_main_<T>.search_layered_bm25(fts_expand_query_t('cruide refinery'), top_k := 10);
+```
+
+How it works: per query word — (1) exact `synonyms` pair wins, (2) exact
+dictionary hit passes through, (3) otherwise the closest `fts_main_<T>.raw_dict`
+term within a **length-tiered edit budget** (≤3 letters: never; 4-5: 1 edit;
+≥6: 2 edits — short words must not be "corrected" into random 1-edit
+lookalikes). Matching is lowercase-aware. The entry point is
+**expand-not-replace**: original query + corrected query searched together, so
+a wrong correction can only lose, never destroy the original ranking.
+
+`test/fts_typo_v2.sql` adds experimental arms, **measured and found not to
+beat v1 on ag_news** (120k, bge-m3, 60 short queries, two scenarios):
+
+| feature | verdict (nDCG@10) |
+|---|---|
+| configurable thresholds `t_mid/t_short/t_long` | additive, back-compatible — keep |
+| explicit edit tiers `fts_word_tier_t` (0/1/2) | tier-weighted RRF ≈ v1, no gain |
+| prefix expansion (3-char trie, top-5 by df) | **net negative** in both 1-typo (0.827→0.822) and truncated-word (0.766→0.757) scenarios: strong for high-distinctiveness truncations (`Namibia`→`Nam` 0.000→0.643), diluted for common words (`Profit`→`Pro`) by the df-ranked expansion |
+
+So v1's `fts_expand_query_t` remains the default; the v2 macros are provided
+for callers who want the knobs (e.g. an autocomplete UI can weight the prefix
+arm itself).
+
+Verified numbers (ag_news, real runs, `D:\wsl2\tmp\fts_vss_poc\eval_*.json`):
+50 short queries each with 1 transposition/substitution typo —
+`expand` 0.644 → **0.705** nDCG@10 (OSA upgrade), `expand+vec` 0.889 → 0.909
+vs `nofix+vec` 0.892. Honest ceiling: correction recall is 13/50 — words the
+corpus never contained (proper names, new words) cannot be corrected by any
+dictionary-based scheme; the corpus's `raw_dict` is 61k terms.
 
 ## Two real bugs found and fixed while making this work
 
