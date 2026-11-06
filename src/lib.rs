@@ -427,6 +427,27 @@ fn read_query_vector(sess: &SessionConn, query_table: &str, query_column: &str)
     Ok(v)
 }
 
+/// Query vector from an in-process scalar expression (e.g.
+/// `ml_embed_sentence('minilm', 'crude oil prices')`): the zg-style single-entry
+/// path where the caller passes text, not a precomputed vector. Same normalization
+/// as read_query_vector (variable-length LIST(FLOAT)).
+fn read_query_expr(sess: &SessionConn, expr: &str) -> Result<Vec<f32>, String> {
+    let sql = format!(
+        "SELECT list_transform(({expr})::FLOAT[], lambda x: x::FLOAT) AS __q FROM (SELECT 1)"
+    );
+    let mut result = sess.con.query(&sql).map_err(|e| e.to_string())?;
+    let mut v: Vec<f32> = Vec::new();
+    match result.next_chunk() {
+        Ok(Some(chunk)) if chunk.size() > 0 => {
+            if !unsafe { read_list_f32(&chunk, 0, 0, &mut v) } {
+                return Err("embed_expr returned NULL".into());
+            }
+        }
+        _ => return Err("embed_expr produced no vector".into()),
+    }
+    Ok(v)
+}
+
 fn do_search(b: &SearchBind) -> Result<Vec<(i64, f32)>, String> {
     let query = {
         let sess = session().map_err(|e| e.message().to_string())?;
@@ -900,6 +921,7 @@ struct HybridBind {
     per_path: i64,
     nprobe: i64,
     k_rrf: i64,
+    embed_expr: String,
 }
 
 struct HybridRow {
@@ -915,11 +937,16 @@ struct HybridState {
 }
 
 fn do_hybrid(b: &HybridBind) -> Result<Vec<HybridRow>, String> {
-    // Vector path: read the query vector from the single-row table, then ivf_search.
+    // Vector path: query vector from embed_expr (in-process scalar, e.g.
+    // ml_embed_sentence(...)) if given, else from the single-row query table.
     let vec_hits: Vec<(i64, usize)> = {
         let query = {
             let sess = session().map_err(|e| e.message().to_string())?;
-            read_query_vector(&sess, &b.query_table, &b.query_col)
+            if b.embed_expr.is_empty() {
+                read_query_vector(&sess, &b.query_table, &b.query_col)
+            } else {
+                read_query_expr(&sess, &b.embed_expr)
+            }
         }?;
         let guard = INDEXES.lock().unwrap();
         let idx = guard
@@ -936,7 +963,10 @@ fn do_hybrid(b: &HybridBind) -> Result<Vec<HybridRow>, String> {
             .map(|(r, (dense, _))| (idx.ids[dense], r))
             .collect()
     };
-    // Text path: FTS layered BM25 on the table's text column.
+    // Text path: FTS layered BM25 on the table's text column. Graceful: if the
+    // table has no FTS index (fts_main_{table} missing), degrade to vector-only
+    // (fts_hits empty) instead of erroring — the RRF then just scores the vector
+    // arm, so a table without FTS still works.
     let q_lit = format!("'{}'", b.query.replace('\'', "''"));
     let fts_sql = format!(
         "SELECT docname::BIGINT AS id, rank FROM fts_main_{}.search_layered_bm25({}, top_k := {})",
@@ -944,27 +974,37 @@ fn do_hybrid(b: &HybridBind) -> Result<Vec<HybridRow>, String> {
     );
     let fts_hits: Vec<(i64, usize)> = {
         let sess = session().map_err(|e| e.message().to_string())?;
-        let mut res = sess
-            .con
-            .query(&fts_sql)
-            .map_err(|e| format!("ivf_hybrid_search: fts: {e}"))?;
-        let mut out = Vec::new();
-        let mut r = 0usize;
-        loop {
-            match res.next_chunk() {
-                Ok(Some(chunk)) if chunk.size() > 0 => {
-                    let n = chunk.size();
-                    let ir = unsafe { chunk.reader(0) };
-                    for i in 0..n {
-                        out.push((unsafe { ir.read_i64(i) }, r));
-                        r += 1;
+        // Probe FTS schema existence first (search_layered_bm25 is only present
+        // when the fts extension built fts_main_{table} for this table).
+        let probe = format!(
+            "SELECT 1 FROM fts_main_{}.search_layered_bm25({}, top_k := 1) LIMIT 1",
+            b.table, q_lit
+        );
+        if sess.con.query(&probe).is_err() {
+            Vec::new()
+        } else {
+            let mut res = sess
+                .con
+                .query(&fts_sql)
+                .map_err(|e| format!("ivf_hybrid_search: fts: {e}"))?;
+            let mut out = Vec::new();
+            let mut r = 0usize;
+            loop {
+                match res.next_chunk() {
+                    Ok(Some(chunk)) if chunk.size() > 0 => {
+                        let n = chunk.size();
+                        let ir = unsafe { chunk.reader(0) };
+                        for i in 0..n {
+                            out.push((unsafe { ir.read_i64(i) }, r));
+                            r += 1;
+                        }
                     }
+                    Ok(Some(_)) | Ok(None) => break,
+                    Err(e) => return Err(format!("ivf_hybrid_search: fts: {e}")),
                 }
-                Ok(Some(_)) | Ok(None) => break,
-                Err(e) => return Err(format!("ivf_hybrid_search: fts: {e}")),
             }
+            out
         }
-        out
     };
     // Reciprocal Rank Fusion (rank is 1-based).
     let mut rrf: HashMap<i64, f64> = HashMap::new();
@@ -1037,12 +1077,6 @@ quack_rs::table_bind_callback!(hybrid_bind, |info| {
             .unwrap_or_default()
             .trim()
             .to_string();
-        if name.is_empty() || table.is_empty() || text_col.is_empty() || query_table.is_empty() {
-            bind_info.set_error(
-                "ivf_hybrid_search: name, table, text_col, query_table are required",
-            );
-            return;
-        }
         for (lbl, s) in [
             ("table", &table),
             ("text_col", &text_col),
@@ -1062,7 +1096,11 @@ quack_rs::table_bind_callback!(hybrid_bind, |info| {
         let per_path = bind_info.get_named_parameter_value("per_path").as_i64().unwrap_or(50);
         let nprobe = bind_info.get_named_parameter_value("nprobe").as_i64().unwrap_or(0);
         let k_rrf = bind_info.get_named_parameter_value("k_rrf").as_i64().unwrap_or(60);
-        // bind-time existence check (index + fts schema) so callers get a clear error.
+        if name.is_empty() || table.is_empty() || text_col.is_empty() || query_table.is_empty() {
+            bind_info.set_error("ivf_hybrid_search: name, table, text_col, query_table are required");
+            return;
+        }
+        // bind-time existence check (index + query table) so callers get a clear error.
         if let Ok(sess) = session() {
             {
                 let guard = INDEXES.lock().unwrap();
@@ -1102,6 +1140,117 @@ quack_rs::table_bind_callback!(hybrid_bind, |info| {
                 per_path,
                 nprobe,
                 k_rrf,
+                embed_expr: String::new(),
+            },
+        );
+    }
+});
+
+/// Bind for `ivf_hybrid_embed(name, table, id_col, text_col, query, embed_expr)`:
+/// the single-call, text-in entry point. `embed_expr` is an in-process scalar SQL
+/// expression that produces the query vector, e.g.
+/// `ml_embed_sentence('minilm', 'crude oil')` — no precomputed query table needed.
+/// `query_table`/`query_col` are left empty so `do_hybrid` uses the embed path.
+quack_rs::table_bind_callback!(embed_bind, |info| {
+    unsafe {
+        let bind_info = BindInfo::new(info);
+        let name = bind_info
+            .get_parameter_value(0)
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let table = bind_info
+            .get_parameter_value(1)
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let id_col = bind_info
+            .get_parameter_value(2)
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let text_col = bind_info
+            .get_parameter_value(3)
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let query = bind_info
+            .get_parameter_value(4)
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let embed_expr = bind_info
+            .get_parameter_value(5)
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        for (lbl, s) in [("table", &table), ("text_col", &text_col)] {
+            if !is_safe_identifier(s) {
+                bind_info.set_error(&format!("ivf_hybrid_embed: {lbl} must be an identifier"));
+                return;
+            }
+        }
+        if !id_col.is_empty() && !is_safe_identifier(&id_col) {
+            bind_info.set_error("ivf_hybrid_embed: id_col must be an identifier or empty");
+            return;
+        }
+        let top_k = bind_info
+            .get_named_parameter_value("top_k")
+            .as_i64()
+            .unwrap_or(10);
+        let per_path = bind_info
+            .get_named_parameter_value("per_path")
+            .as_i64()
+            .unwrap_or(50);
+        let nprobe = bind_info
+            .get_named_parameter_value("nprobe")
+            .as_i64()
+            .unwrap_or(0);
+        let k_rrf = bind_info
+            .get_named_parameter_value("k_rrf")
+            .as_i64()
+            .unwrap_or(60);
+        if name.is_empty() || table.is_empty() || text_col.is_empty() || embed_expr.is_empty() {
+            bind_info.set_error("ivf_hybrid_embed: name, table, text_col, embed_expr are required");
+            return;
+        }
+        // bind-time index-existence check for a clear error.
+        {
+            let guard = INDEXES.lock().unwrap();
+            if !guard.contains_key(&name) {
+                bind_info.set_error(&format!(
+                    "no ivf index named '{}' — call ivf_create_index or ivf_load first",
+                    name
+                ));
+                return;
+            }
+        }
+        bind_info
+            .add_result_column("id", TypeId::BigInt)
+            .add_result_column("score", TypeId::Double)
+            .add_result_column("bm25_rank", TypeId::BigInt)
+            .add_result_column("vec_rank", TypeId::BigInt)
+            .set_cardinality(top_k.max(1) as u64, false);
+        FfiBindData::<HybridBind>::set(
+            info,
+            HybridBind {
+                name,
+                table,
+                id_col,
+                text_col,
+                query,
+                query_table: String::new(),
+                query_col: String::new(),
+                top_k,
+                per_path,
+                nprobe,
+                k_rrf,
+                embed_expr,
             },
         );
     }
@@ -1327,6 +1476,33 @@ unsafe fn register_all(con: &Connection) -> Result<(), ExtensionError> {
             .named_param("nprobe", TypeId::BigInt)
             .named_param("k_rrf", TypeId::BigInt)
             .bind(hybrid_bind)
+            .init(hybrid_init)
+            .scan(hybrid_scan),
+    )?;
+
+    // ivf_hybrid_embed(name, table, id_col, text_col, query, embed_expr)
+    // -> table(id BIGINT, score DOUBLE, bm25_rank BIGINT, vec_rank BIGINT)
+    //
+    // The single-call, text-in entry point. `embed_expr` is an in-process scalar
+    // SQL expression that produces the query vector, e.g.
+    //   ivf_hybrid_embed('news','news','id','text','crude oil',
+    //                    "ml_embed_sentence('minilm','crude oil')")
+    // so no precomputed query table is needed — the vector is embedded in-process
+    // (duckdb-ml) and fused with FTS BM25 via RRF. Named params (top_k, per_path,
+    // nprobe, k_rrf) and result columns are shared with ivf_hybrid_search.
+    con.register_table(
+        TableFunctionBuilder::new("ivf_hybrid_embed")
+            .param(TypeId::Varchar)
+            .param(TypeId::Varchar)
+            .param(TypeId::Varchar)
+            .param(TypeId::Varchar)
+            .param(TypeId::Varchar)
+            .param(TypeId::Varchar)
+            .named_param("top_k", TypeId::BigInt)
+            .named_param("per_path", TypeId::BigInt)
+            .named_param("nprobe", TypeId::BigInt)
+            .named_param("k_rrf", TypeId::BigInt)
+            .bind(embed_bind)
             .init(hybrid_init)
             .scan(hybrid_scan),
     )?;

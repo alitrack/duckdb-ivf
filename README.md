@@ -30,7 +30,8 @@ index type. `duckdb-ivf` fills exactly that gap: a real, in-DB ANN index you cre
 | `ivf_create_index(name, table, id_column, vector_column, nlist, niter, normalize)` | table | Train + register an IVF index over a table's vector column. Returns 1 row `(rows_indexed BIGINT)`. |
 | `ivf_search(name, query_table, query_column, top_k := 10, nprobe := 0)` | table | Approximate search. Returns `(id BIGINT, score DOUBLE)` for the top-k. |
 | `ivf_search_exact(name, query_table, query_column, top_k := 10)` | table | Exhaustive ground-truth search (brute force over all `n`). |
-| `ivf_hybrid_search(name, table, id_column, text_column, query, query_table, query_column, top_k := 10, per_path := 50, nprobe := 0, k_rrf := 60)` | table | **Hybrid** FTS BM25 (`fts` extension, `fts_main_<table>.search_layered_bm25`) + IVF vector, fused by Reciprocal Rank Fusion; ties broken by `id` for reproducible results. Returns `(id BIGINT, score DOUBLE, bm25_rank INT, vec_rank INT)`. `id_column` may be empty (positions are used). |
+| `ivf_hybrid_search(name, table, id_column, text_column, query, query_table, query_column, top_k := 10, per_path := 50, nprobe := 0, k_rrf := 60)` | table | **Hybrid** FTS BM25 (`fts` extension, `fts_main_<table>.search_layered_bm25`) + IVF vector, fused by Reciprocal Rank Fusion; ties broken by `id` for reproducible results. Returns `(id BIGINT, score DOUBLE, bm25_rank INT, vec_rank INT)`. `id_column` may be empty (positions are used). The query vector comes from a 1-row `query_table.query_column`. |
+| `ivf_hybrid_embed(name, table, id_column, text_column, query, embed_expr, top_k := 10, per_path := 50, nprobe := 0, k_rrf := 60)` | table | **Single-call, text-in** hybrid search: same RRF fusion as `ivf_hybrid_search`, but the query vector is embedded **in-process** from `query` via `embed_expr` — an arbitrary scalar SQL expression returning a `LIST`/`ARRAY`, e.g. `ml_embed_sentence('minilm','crude oil')` (duckdb-ml). No precomputed query table needed. Same result columns. |
 | `ivf_save(name, path)` | table | Serialize a registered index to a file (vectors + centroids + list assignment + id map). Returns `(name, dim, n, nlist, bytes, message)`. |
 | `ivf_load(name, path)` | table | Rebuild an index from a file written by `ivf_save` **without retraining** (lists are deterministically rebuilt from the assignment). Returns the same columns as `ivf_save`; `message = 'ok (no retrain)'`. |
 | `ivf_list()` | table | List registered indexes: `(name, dim, n, nlist)`. |
@@ -91,6 +92,30 @@ FROM ivf_hybrid_search('news', 'news', 'id', 'text',
 - `per_path` = how many docs each arm feeds into the fusion (default 50).
 - `nprobe` = IVF probing for the vector arm (0 = exhaustive).
 - `k_rrf` = RRF constant (60 is the Meilisearch convention).
+
+### Single-call text-in search (no precomputed vector)
+
+`ivf_hybrid_embed` removes the last external step — you hand it the raw query
+text and an in-process embedding expression; the vector arm is computed
+in-process (duckdb-ml), so no `query_table` and no network embedding call:
+
+```sql
+-- corpus vectors were also embedded in-process (ml_embed_sentence) + indexed;
+-- now a query is ONE call, text in, top-k out:
+SELECT id, score, bm25_rank, vec_rank
+FROM ivf_hybrid_embed('news', 'news', 'id', 'text', 'crude oil prices',
+                      "ml_embed_sentence('minilm', 'crude oil prices')",
+                      top_k := 10, per_path := 50, nprobe := 8, k_rrf := 60);
+```
+
+- `embed_expr` is any scalar SQL expression returning a `LIST`/`ARRAY` of the
+  same dimension as the index; the extension evaluates it on its session
+  connection (so the embedding model must already be `ml_load_sentence`'d).
+- Verified: `ivf_hybrid_embed` (text in) == `ivf_hybrid_search` (qtab) == a
+  hand-written SQL RRF baseline, id-for-id on 3 queries (fresh process,
+  `ivf_load` no-retrain, ~45 ms/query).
+- If the table has no FTS index, the text arm degrades gracefully to
+  vector-only (RRF just scores the vector arm) instead of erroring.
 
 ### Important: the session connection
 
@@ -228,8 +253,8 @@ pure constant-foldable scalar. It is now a table function.)
 
 - `src/ivf.rs` — pure-Rust IVF engine (k-means + search + `load_from` for no-retrain
   rebuild), zero deps.
-- `src/lib.rs` — quack-rs C-API binding: 8 table/scalar functions (create/search/
-  search_exact/hybrid_search/save/load/list/version), session connection, LIST reader,
-  RRF fusion.
+- `src/lib.rs` — quack-rs C-API binding: 9 table/scalar functions (create/search/
+  search_exact/hybrid_search/hybrid_embed/save/load/list/version), session connection,
+  LIST reader, RRF fusion.
 - `test_e2e.py` — acceptance test on real ag_news bge-m3 embeddings.
 - `Makefile`, `Cargo.toml` — C-API extension build (tiktoken skeleton, zero new deps).
