@@ -117,6 +117,28 @@ FROM ivf_hybrid_embed('news', 'news', 'id', 'text', 'crude oil prices',
 - If the table has no FTS index, the text arm degrades gracefully to
   vector-only (RRF just scores the vector arm) instead of erroring.
 
+### `ztg` single entry point (text in, top-k out)
+
+For the zg-style *one call* experience, `ztg/ztg.sql` ships a deployable macro that
+wraps the two in-house extensions into a single user-facing call:
+
+```sql
+-- one-time deployment: LOAD ivf + ml (abs paths), train+persist index,
+-- create_fts_index, ml_load_sentence; then run ztg/ztg.sql (edit 5 literals).
+
+SELECT * FROM ztg_search_news('crude oil prices');            -- top_k := 10
+SELECT * FROM ztg_search_news('crude oil prices', 20);        -- explicit top_k
+```
+
+The query vector is embedded in-process (`ml_embed_sentence`) — no precomputed
+vector, no network. **Design constraint found while building this**: a C-API
+table function binds its arguments as *constants* — subqueries/macros-in-args
+raise `Table function cannot contain subqueries`, so the profile (index/table/
+model) is baked into one macro per deployment (one index/table ⇒ one macro
+name). Quotes in the embedded expression are built with `chr(39)` because
+`''` escapes are swallowed inside table-function macros. Known limitation:
+query text containing `'` does not round-trip.
+
 ### Important: the session connection
 
 A C-API extension **cannot see the caller's connection**. `duckdb-ivf` opens its own
@@ -279,4 +301,5 @@ pure constant-foldable scalar. It is now a table function.)
 - `test_e2e.py` — acceptance test on real ag_news bge-m3 embeddings
   (recall@k, nprobe sweep, e2e nDCG@10 via `ztg_poc/ndcg_e2e.py`,
   real-query-vector variant in `ztg_poc/ndcg_real.py`).
+- `ztg/ztg.sql` — deployable single-call macro (`ztg_search_*`, text in → top-k).
 - `Makefile`, `Cargo.toml` — C-API extension build (tiktoken skeleton, zero new deps).
