@@ -119,25 +119,29 @@ FROM ivf_hybrid_embed('news', 'news', 'id', 'text', 'crude oil prices',
 
 ### `ztg` single entry point (text in, top-k out)
 
-For the zg-style *one call* experience, `ztg/ztg.sql` ships a deployable macro that
-wraps the two in-house extensions into a single user-facing call:
+For the zg-style *one call* experience, `ztg/ztg.sql` is **one file that deploys
+and searches** — no shell script, no separate deploy step. Edit the literals
+marked `(EDIT)` (extension paths, model paths, corpus, index path, profile)
+once, execute the whole file, and the only thing a search caller writes is:
 
 ```sql
--- one-time deployment: LOAD ivf + ml (abs paths), train+persist index,
--- create_fts_index, ml_load_sentence; then run ztg/ztg.sql (edit 5 literals).
-
 SELECT * FROM ztg_search_news('crude oil prices');            -- top_k := 10
 SELECT * FROM ztg_search_news('crude oil prices', 20);        -- explicit top_k
 ```
 
-The query vector is embedded in-process (`ml_embed_sentence`) — no precomputed
-vector, no network. **Design constraint found while building this**: a C-API
-table function binds its arguments as *constants* — subqueries/macros-in-args
-raise `Table function cannot contain subqueries`, so the profile (index/table/
-model) is baked into one macro per deployment (one index/table ⇒ one macro
-name). Quotes in the embedded expression are built with `chr(39)` because
-`''` escapes are swallowed inside table-function macros. Known limitation:
-query text containing `'` does not round-trip.
+The file contains, in order: LOAD ivf/ml/fts → `ml_load_sentence` → corpus
+table → `ivf_load` (with the fresh-train variant commented alongside) →
+`create_fts_index` → the `ztg_search_*` macro. Connect with unsigned
+extensions allowed. Verified: full file deploys in ~1s on the 5k PoC corpus,
+3/3 queries == `ivf_hybrid_embed`.
+
+**Design constraint found while building this**: a C-API table function binds
+its arguments as *constants* — subqueries/macros-in-args raise
+`Table function cannot contain subqueries`, so the profile (index/table/model)
+is baked into one macro per deployment (one index/table ⇒ one macro name).
+Quotes in the embedded expression are built with `chr(39)` because `''`
+escapes are swallowed inside table-function macros. Known limitation: query
+text containing `'` does not round-trip.
 
 ### Important: the session connection
 
@@ -301,5 +305,5 @@ pure constant-foldable scalar. It is now a table function.)
 - `test_e2e.py` — acceptance test on real ag_news bge-m3 embeddings
   (recall@k, nprobe sweep, e2e nDCG@10 via `ztg_poc/ndcg_e2e.py`,
   real-query-vector variant in `ztg_poc/ndcg_real.py`).
-- `ztg/ztg.sql` — deployable single-call macro (`ztg_search_*`, text in → top-k).
+- `ztg/ztg.sql` — single file: deploys + searches (`ztg_search_*`, text in → top-k).
 - `Makefile`, `Cargo.toml` — C-API extension build (tiktoken skeleton, zero new deps).
