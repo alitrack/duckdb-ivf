@@ -9,8 +9,9 @@ vector **index** — core's `list_distance` is brute-force kNN, and this build h
 index type. `duckdb-ivf` fills exactly that gap: a real, in-DB ANN index you create and query from SQL.
 
 > Honest framing: this is a **reusable skeleton with a working data plane**, not a production
-> vector engine. Training is single-threaded k-means (no SIMD, no persistence, no parallel build).
-> See [Limitations](#limitations).
+> vector engine. Training is single-threaded k-means (no SIMD, no parallel build).
+> The index **can** be persisted to a file and reloaded without retraining
+> (`ivf_save` / `ivf_load`). See [Limitations](#limitations-be-honest-about-these).
 
 ## Why an IVF index and not HNSW
 
@@ -29,6 +30,9 @@ index type. `duckdb-ivf` fills exactly that gap: a real, in-DB ANN index you cre
 | `ivf_create_index(name, table, id_column, vector_column, nlist, niter, normalize)` | table | Train + register an IVF index over a table's vector column. Returns 1 row `(rows_indexed BIGINT)`. |
 | `ivf_search(name, query_table, query_column, top_k := 10, nprobe := 0)` | table | Approximate search. Returns `(id BIGINT, score DOUBLE)` for the top-k. |
 | `ivf_search_exact(name, query_table, query_column, top_k := 10)` | table | Exhaustive ground-truth search (brute force over all `n`). |
+| `ivf_hybrid_search(name, table, id_column, text_column, query, query_table, query_column, top_k := 10, per_path := 50, nprobe := 0, k_rrf := 60)` | table | **Hybrid** FTS BM25 (`fts` extension, `fts_main_<table>.search_layered_bm25`) + IVF vector, fused by Reciprocal Rank Fusion; ties broken by `id` for reproducible results. Returns `(id BIGINT, score DOUBLE, bm25_rank INT, vec_rank INT)`. `id_column` may be empty (positions are used). |
+| `ivf_save(name, path)` | table | Serialize a registered index to a file (vectors + centroids + list assignment + id map). Returns `(name, dim, n, nlist, bytes, message)`. |
+| `ivf_load(name, path)` | table | Rebuild an index from a file written by `ivf_save` **without retraining** (lists are deterministically rebuilt from the assignment). Returns the same columns as `ivf_save`; `message = 'ok (no retrain)'`. |
 | `ivf_list()` | table | List registered indexes: `(name, dim, n, nlist)`. |
 | `ivf_version()` | scalar | Extension version. |
 | `ivf_levenshtein(a, b)` / `(a, b, maxd)` | scalar | OSA Damerau-Levenshtein edit distance (transposition = 1), saturated at 3 / `maxd`. Building block for the fts typo-tolerance macro layer, see [Typo tolerance](#typo-tolerance--synonyms-meilisearch-style-on-top-of-fts). |
@@ -54,6 +58,40 @@ CREATE TABLE q1 AS SELECT [0.1, 0.2, ...] AS vec;   -- 1024 floats
 SELECT id, score FROM ivf_search('news', 'q1', 'vec', top_k := 10, nprobe := 32);
 ```
 
+### Persistence (no retraining)
+
+```sql
+-- After training once (one-off ~157s for 120k × 1024):
+SELECT * FROM ivf_save('news', '/path/to/news.ivf.idx');   -- 1 row, message = 'ok'
+
+-- Later, in a FRESH process — no k-means, ~1.1s, bit-identical search results:
+SELECT * FROM ivf_load('news', '/path/to/news.ivf.idx');   -- message = 'ok (no retrain)'
+SELECT id, score FROM ivf_search('news', 'q1', 'vec', top_k := 10, nprobe := 8);
+```
+File format (v1, little-endian, magic `0x4346_5649`/`'IVFC'`):
+header (`magic`, `version`, `dim`, `nlist`, `n`) + `data` (n×dim f32) +
+`centroids` (nlist×dim f32) + `list_of` (n u32) + `ids` (n i64). The inverted
+`lists` are rebuilt deterministically from `list_of`, so a loaded index searches
+**bit-identical** to the trained one — verified top-10 id-for-id.
+
+### Hybrid search (BM25 + vector, RRF fusion)
+
+```sql
+-- Table must have an FTS index (fts extension, layered_search=true):
+PRAGMA create_fts_index('news', 'id', 'text', stemmer := 'porter',
+                        stopwords := 'english', layered_search := true);
+
+-- query_table.query_column holds the query's embedding (1-row table); `query`
+-- is the raw text for the BM25 arm. RRF fuses both arms; ties broken by id.
+SELECT id, score, bm25_rank, vec_rank
+FROM ivf_hybrid_search('news', 'news', 'id', 'text',
+                       'crude oil prices', 'q1', 'vec',
+                       top_k := 10, per_path := 50, nprobe := 8, k_rrf := 60);
+```
+- `per_path` = how many docs each arm feeds into the fusion (default 50).
+- `nprobe` = IVF probing for the vector arm (0 = exhaustive).
+- `k_rrf` = RRF constant (60 is the Meilisearch convention).
+
 ### Important: the session connection
 
 A C-API extension **cannot see the caller's connection**. `duckdb-ivf` opens its own
@@ -63,31 +101,26 @@ table and the query table. Consequences:
 - The indexed table and the query table must be **permanent tables** (the session
   connection cannot see the caller's temp tables or `register()`ed in-memory views).
 - The index lives in a process-global registry for the process lifetime, addressed by
-  `name`. It is not persisted across DuckDB restarts (re-run `ivf_create_index`).
+  `name`. It is **not** persisted across DuckDB restarts automatically — use
+  `ivf_save(name, path)` / `ivf_load(name, path)` to persist and reload (no retraining).
 - Multi-database / re-entrant use is guarded (a `ReentryMark` prevents a table
   callback from running a nested query on the very connection it's scanning).
 
 ## Build
 
 ```bash
-# C-API extension: quack-rs 0.18.0 + libduckdb-sys (loadable). All deps offline-cached.
-CARGO_TARGET_DIR=/home/lhy/ivf-target cargo build --release --lib --offline
-# → target/release/libivf.so
+# C-API extension: quack-rs 0.18.0 + libduckdb-sys (loadable).
+# Build on the Linux toolchain — on a Windows host `cargo build` produces a
+# .dll and pollutes the shared target/ dir.
+CARGO_HOME=/home/lhy/.cargo make release
+# → build/release/ivf.duckdb_extension
 ```
 
-DuckDB 2.0 requires a 512-byte metadata footer on loadables. Stamp the `.so`:
-
-```python
-def stamp(so, dst, ext="v0.1.0", db="v1.2.0", plat="linux_amd64"):
-    data = open(so, "rb").read()
-    if data[-512:-480].split(b"\x00")[0] == b"4":
-        data = data[:-512]
-    f = b"".join(s.encode().ljust(32, b"\x00") for s in
-                 ["", "", "", "C_STRUCT", ext, db, plat, "4"])
-    open(dst, "wb").write(data + f.ljust(512, b"\x00"))
-```
-
-Then `SET allow_unsigned_extensions=1; LOAD 'ivf.duckdb_extension';`.
+`make release` uses the official `extension-ci-tools` Makefile, which compiles
+with the DuckDB-1.2-ABI Rust toolchain and stamps the proper metadata footer via
+`append_extension_metadata.py` (534-byte footer; DuckDB 2.0 requires it on
+loadables). No manual footer hack needed. Then
+`SET allow_unsigned_extensions=1; LOAD 'ivf.duckdb_extension';`.
 
 ## Verified (ag_news, bge-m3 120,000 × 1024, L2-normalized)
 
@@ -183,8 +216,9 @@ pure constant-foldable scalar. It is now a table function.)
 ## Limitations (be honest about these)
 
 - **Training is single-threaded** k-means: ~157 s for 120k × 1024 with nlist=350, niter=10.
-  No SIMD, no parallel build, no incremental updates.
-- **No persistence**: the index is in-memory for the process lifetime.
+  No SIMD, no parallel build, no incremental updates. `ivf_save`/`ivf_load` makes the
+  cost one-off: save once (~1 s, ~494 MB for 120k × 1024), reload in fresh processes in
+  ~1.1 s with bit-identical search results (verified top-10 id-for-id).
 - **nprobe=350 is exhaustive**, so default recall = exact; you must set a small `nprobe`
   to get the sublinear speedup (see the sweep).
 - **Memory**: stores all `n` vectors in a flat `Vec<f32>` (120k × 1024 × 4 B ≈ 480 MB).
@@ -192,7 +226,10 @@ pure constant-foldable scalar. It is now a table function.)
 
 ## Files
 
-- `src/ivf.rs` — pure-Rust IVF engine (k-means + search), zero deps.
-- `src/lib.rs` — quack-rs C-API binding: 5 functions, session connection, LIST reader.
+- `src/ivf.rs` — pure-Rust IVF engine (k-means + search + `load_from` for no-retrain
+  rebuild), zero deps.
+- `src/lib.rs` — quack-rs C-API binding: 8 table/scalar functions (create/search/
+  search_exact/hybrid_search/save/load/list/version), session connection, LIST reader,
+  RRF fusion.
 - `test_e2e.py` — acceptance test on real ag_news bge-m3 embeddings.
 - `Makefile`, `Cargo.toml` — C-API extension build (tiktoken skeleton, zero new deps).

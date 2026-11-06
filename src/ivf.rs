@@ -57,7 +57,7 @@ pub struct Ivf {
     /// Centroids, row-major `[nlist * dim]`.
     pub centroids: Vec<f32>,
     /// For each vector, the centroid (list) it was assigned to.
-    list_of: Vec<usize>,
+    pub list_of: Vec<usize>,
     /// Per-list vector ids (row-major order preserved within a list).
     pub lists: Vec<Vec<usize>>,
     /// All stored vectors, row-major `[n * dim]`, addressed by dense index.
@@ -173,6 +173,39 @@ impl Ivf {
             lists,
             data,
         })
+    }
+
+    /// Reconstruct an index from a previously `save`d state — NO retraining.
+    /// `lists` is rebuilt deterministically from `list_of`, so the search results
+    /// are bit-identical to the trained index.
+    pub fn load_from(
+        dim: usize,
+        n: usize,
+        nlist: usize,
+        centroids: Vec<f32>,
+        list_of: Vec<usize>,
+        data: Vec<f32>,
+    ) -> Result<Self, String> {
+        if dim == 0 || n == 0 || nlist == 0 {
+            return Err("ivf: dim/n/nlist must be > 0".into());
+        }
+        if data.len() != n * dim {
+            return Err(format!("ivf: data len {} != n*dim {}", data.len(), n * dim));
+        }
+        if centroids.len() != nlist * dim {
+            return Err(format!("ivf: centroids len {} != nlist*dim {}", centroids.len(), nlist * dim));
+        }
+        if list_of.len() != n {
+            return Err(format!("ivf: list_of len {} != n {}", list_of.len(), n));
+        }
+        let mut lists: Vec<Vec<usize>> = vec![Vec::new(); nlist];
+        for (i, &c) in list_of.iter().enumerate() {
+            if c >= nlist {
+                return Err(format!("ivf: list_of[{i}]={c} out of range (nlist={nlist})"));
+            }
+            lists[c].push(i);
+        }
+        Ok(Ivf { dim, n, nlist, centroids, list_of, lists, data })
     }
 
     /// Exact inner-product search over all stored vectors (recall reference /

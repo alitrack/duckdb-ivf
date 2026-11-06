@@ -13,6 +13,15 @@
 //!       -> table(id BIGINT, score DOUBLE)   (ANN: probe nprobe nearest lists)
 //!   ivf_search_exact(name, query_table, query_column, top_k)
 //!       -> table(id BIGINT, score DOUBLE)   (brute force; recall baseline)
+//!   ivf_hybrid_search(name, table, id_column, text_column, query,
+//!                     query_table, query_column,
+//!                     [top_k, per_path, nprobe, k_rrf])
+//!       -> table(id BIGINT, score DOUBLE, bm25_rank INT, vec_rank INT)
+//!       FTS BM25 (fts extension) + IVF vector, fused by Reciprocal Rank
+//!       Fusion; ties broken by id for reproducible results. The query
+//!       vector is read from a single-row table (query_table.query_column
+//!       = the query's embedding). This is the in-process hybrid-search
+//!       entry point that complements `fts`. id_column may be empty.
 //!   ivf_list()
 //!       -> table(name VARCHAR, dim INT, n BIGINT, nlist INT)
 //!   ivf_version() -> VARCHAR
@@ -43,6 +52,7 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard, OnceLock};
 
@@ -596,6 +606,574 @@ quack_rs::table_scan_callback!(ivf_list_scan, |info, output| {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Table functions: ivf_save(name, path)  /  ivf_load(name, path)
+//
+// Persistence for the in-memory IVF registry. A saved index is a single binary
+// file (little-endian, no compression):
+//
+//   [header  16 bytes: magic u32=0x4956_4643 ("FCVI" LE), version u32, dim u32, nlist u32]
+//   [n  u32]
+//   [n*dim   f32  data (row-major, dense order)]
+//   [nlist*dim f32  centroids (row-major)]
+//   [n      u32  list_of (centroid assignment per dense row)]
+//   [n      i64  ids   (caller id per dense row, if has_ids; else dense 0..n)]
+//
+// `ivf_load` reconstructs WITHOUT retraining (k-means is the 157s cost), so a
+// cold start drops from ~157s to a file read + memcpy. `lists` is rebuilt
+// deterministically from `list_of`, so search results are bit-identical to the
+// trained index.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const IVF_MAGIC: u32 = 0x4346_5649; // "IVFC"
+const IVF_VERSION: u32 = 1;
+
+struct SaveLoadState {
+    // one result row: (name, dim, n, nlist, bytes, message)
+    name: String,
+    dim: i32,
+    n: i64,
+    nlist: i32,
+    bytes: i64,
+    message: String,
+    next: usize,
+}
+
+fn sl_row(name: &str, dim: i32, n: i64, nlist: i32, bytes: i64, message: &str) -> (String, i32, i64, i32, i64, String) {
+    (name.to_string(), dim, n, nlist, bytes, message.to_string())
+}
+
+struct SlBind {
+    name: String,
+    path: String,
+}
+
+fn bind_sl(info: libduckdb_sys::duckdb_bind_info) {
+    unsafe {
+        let bind_info = BindInfo::new(info);
+        let name = bind_info
+            .get_parameter_value(0)
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let path = bind_info
+            .get_parameter_value(1)
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        bind_info
+            .add_result_column("name", TypeId::Varchar)
+            .add_result_column("dim", TypeId::Integer)
+            .add_result_column("n", TypeId::BigInt)
+            .add_result_column("nlist", TypeId::Integer)
+            .add_result_column("bytes", TypeId::BigInt)
+            .add_result_column("message", TypeId::Varchar)
+            .set_cardinality(1, true);
+        FfiBindData::<SlBind>::set(info, SlBind { name, path });
+    }
+}
+quack_rs::table_bind_callback!(save_bind, |info| {
+    bind_sl(info);
+});
+quack_rs::table_bind_callback!(load_bind, |info| {
+    bind_sl(info);
+});
+
+fn read_u32(buf: &[u8], off: &mut usize) -> Option<u32> {
+    if *off + 4 > buf.len() { return None; }
+    let v = u32::from_le_bytes(buf[*off..*off + 4].try_into().ok()?);
+    *off += 4; Some(v)
+}
+fn read_u32s(buf: &[u8], off: &mut usize, cnt: usize) -> Option<Vec<u32>> {
+    let mut out = Vec::with_capacity(cnt);
+    for _ in 0..cnt { out.push(read_u32(buf, off)?); }
+    Some(out)
+}
+fn read_f32s(buf: &[u8], off: &mut usize, cnt: usize) -> Option<Vec<f32>> {
+    if *off + cnt * 4 > buf.len() { return None; }
+    let mut out = Vec::with_capacity(cnt);
+    for i in 0..cnt {
+        let v = f32::from_le_bytes(buf[*off + i * 4..*off + i * 4 + 4].try_into().ok()?);
+        out.push(v);
+    }
+    *off += cnt * 4; Some(out)
+}
+fn read_i64s(buf: &[u8], off: &mut usize, cnt: usize) -> Option<Vec<i64>> {
+    if *off + cnt * 8 > buf.len() { return None; }
+    let mut out = Vec::with_capacity(cnt);
+    for i in 0..cnt {
+        let v = i64::from_le_bytes(buf[*off + i * 8..*off + i * 8 + 8].try_into().ok()?);
+        out.push(v);
+    }
+    *off += cnt * 8; Some(out)
+}
+
+quack_rs::table_init_callback!(save_init, |info| {
+    unsafe {
+        let init_info = InitInfo::new(info);
+        init_info.set_max_threads(1);
+        let Some(b) = FfiBindData::<SlBind>::get_from_init(info) else {
+            FfiInitData::<SaveLoadState>::set(
+                info,
+                SaveLoadState { name: String::new(), dim: 0, n: 0, nlist: 0, bytes: 0, message: "no bind data".into(), next: 0 },
+            );
+            return;
+        };
+        let name = b.name.clone();
+        let path = b.path.clone();
+
+        let (name_o, dim, n, nlist, bytes, message) = if name.is_empty() || path.is_empty() {
+            sl_row(&name, 0, 0, 0, 0, "ivf_save: name and path must be non-empty")
+        } else {
+            let guard = INDEXES.lock().unwrap();
+            match guard.get(&name) {
+                Some(v) => {
+                    let ivf = &v.ivf;
+                    let n = ivf.n;
+                    let dim = ivf.dim;
+                    let nlist = ivf.nlist;
+                    let ids_len = if v.ids.len() == n { n } else { 0 };
+                    let mut buf: Vec<u8> = Vec::with_capacity(
+                        20 + n * 4 + n * dim * 4 + nlist * dim * 4 + n * 4 + ids_len * 8);
+                    // header
+                    buf.extend_from_slice(&IVF_MAGIC.to_le_bytes());
+                    buf.extend_from_slice(&IVF_VERSION.to_le_bytes());
+                    buf.extend_from_slice(&(dim as u32).to_le_bytes());
+                    buf.extend_from_slice(&(nlist as u32).to_le_bytes());
+                    buf.extend_from_slice(&(n as u32).to_le_bytes());
+                    // data
+                    for &x in ivf.data.iter() { buf.extend_from_slice(&x.to_le_bytes()); }
+                    // centroids
+                    for &x in ivf.centroids.iter() { buf.extend_from_slice(&x.to_le_bytes()); }
+                    // list_of
+                    for &c in ivf.list_of.iter() { buf.extend_from_slice(&(c as u32).to_le_bytes()); }
+                    // ids (if aligned)
+                    if ids_len > 0 { for &id in v.ids.iter() { buf.extend_from_slice(&id.to_le_bytes()); } }
+                    match fs::write(&path, &buf) {
+                        Ok(_) => sl_row(&name, dim as i32, n as i64, nlist as i32, buf.len() as i64, "ok"),
+                        Err(e) => sl_row(&name, dim as i32, n as i64, nlist as i32, 0, &format!("write failed: {e}")),
+                    }
+                }
+                None => sl_row(&name, 0, 0, 0, 0, "no such index — call ivf_create_index or ivf_load first"),
+            }
+        };
+        FfiInitData::<SaveLoadState>::set(
+            info,
+            SaveLoadState { name: name_o, dim, n, nlist, bytes, message, next: 0 },
+        );
+    }
+});
+
+quack_rs::table_init_callback!(load_init, |info| {
+    unsafe {
+        let init_info = InitInfo::new(info);
+        init_info.set_max_threads(1);
+        let Some(b) = FfiBindData::<SlBind>::get_from_init(info) else {
+            FfiInitData::<SaveLoadState>::set(
+                info,
+                SaveLoadState { name: String::new(), dim: 0, n: 0, nlist: 0, bytes: 0, message: "no bind data".into(), next: 0 },
+            );
+            return;
+        };
+        let name = b.name.clone();
+        let path = b.path.clone();
+
+        let (name_o, dim, n, nlist, bytes, message) = if name.is_empty() || path.is_empty() {
+            sl_row(&name, 0, 0, 0, 0, "ivf_load: name and path must be non-empty")
+        } else {
+            match fs::read(&path) {
+                Err(e) => sl_row(&name, 0, 0, 0, 0, &format!("read failed: {e}")),
+                Ok(buf) => {
+                    let mut off = 0usize;
+                    let magic = read_u32(&buf, &mut off).unwrap_or(0);
+                    let version = read_u32(&buf, &mut off).unwrap_or(0);
+                    if magic != IVF_MAGIC {
+                        sl_row(&name, 0, 0, 0, buf.len() as i64, "bad magic — not an ivf file")
+                    } else if version != IVF_VERSION {
+                        sl_row(&name, 0, 0, 0, buf.len() as i64, &format!("unsupported version {version}"))
+                    } else {
+                        let dim = read_u32(&buf, &mut off).map(|v| v as usize).unwrap_or(0);
+                        let nlist = read_u32(&buf, &mut off).map(|v| v as usize).unwrap_or(0);
+                        let n = read_u32(&buf, &mut off).map(|v| v as usize).unwrap_or(0);
+                        let data = read_f32s(&buf, &mut off, n.saturating_mul(dim));
+                        let cents = read_f32s(&buf, &mut off, nlist.saturating_mul(dim));
+                        let list_of = read_u32s(&buf, &mut off, n).map(|v| v.iter().map(|&x| x as usize).collect::<Vec<usize>>());
+                        let ids = read_i64s(&buf, &mut off, n);
+                        let (data, cents, list_of, ids) = match (data, cents, list_of, ids) {
+                            (Some(d), Some(c), Some(l), Some(i)) => (d, c, l, i),
+                            _ => {
+                                FfiInitData::<SaveLoadState>::set(
+                                    info,
+                                    SaveLoadState { name: name.clone(), dim: 0, n: 0, nlist: 0, bytes: buf.len() as i64, message: "truncated file".into(), next: 0 },
+                                );
+                                return;
+                            }
+                        };
+                        let ids = if ids.len() == n { ids } else { (0..n as i64).collect::<Vec<i64>>() };
+                        match Ivf::load_from(dim, n, nlist, cents, list_of, data) {
+                            Err(e) => sl_row(&name, dim as i32, n as i64, nlist as i32, buf.len() as i64, &e),
+                            Ok(ivf) => {
+                                INDEXES.lock().unwrap().insert(name.clone(), VssIndex { ivf, ids });
+                                sl_row(&name, dim as i32, n as i64, nlist as i32, buf.len() as i64, "ok (no retrain)")
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        FfiInitData::<SaveLoadState>::set(
+            info,
+            SaveLoadState { name: name_o, dim, n, nlist, bytes, message, next: 0 },
+        );
+    }
+});
+
+quack_rs::table_scan_callback!(save_scan, |info, output| {
+    unsafe {
+        let chunk = DataChunk::from_raw(output);
+        let Some(state) = FfiInitData::<SaveLoadState>::get_mut(info) else {
+            chunk.set_size(0);
+            return;
+        };
+        if state.next >= 1 {
+            chunk.set_size(0);
+            return;
+        }
+        let mut w = chunk.writer(0);
+        w.write_varchar(0, &state.name);
+        let mut w = chunk.writer(1);
+        w.write_i32(0, state.dim);
+        let mut w = chunk.writer(2);
+        w.write_i64(0, state.n);
+        let mut w = chunk.writer(3);
+        w.write_i32(0, state.nlist);
+        let mut w = chunk.writer(4);
+        w.write_i64(0, state.bytes);
+        let mut w = chunk.writer(5);
+        w.write_varchar(0, &state.message);
+        state.next = 1;
+        chunk.set_size(1);
+    }
+});
+quack_rs::table_scan_callback!(load_scan, |info, output| {
+    unsafe {
+        let chunk = DataChunk::from_raw(output);
+        let Some(state) = FfiInitData::<SaveLoadState>::get_mut(info) else {
+            chunk.set_size(0);
+            return;
+        };
+        if state.next >= 1 {
+            chunk.set_size(0);
+            return;
+        }
+        let mut w = chunk.writer(0);
+        w.write_varchar(0, &state.name);
+        let mut w = chunk.writer(1);
+        w.write_i32(0, state.dim);
+        let mut w = chunk.writer(2);
+        w.write_i64(0, state.n);
+        let mut w = chunk.writer(3);
+        w.write_i32(0, state.nlist);
+        let mut w = chunk.writer(4);
+        w.write_i64(0, state.bytes);
+        let mut w = chunk.writer(5);
+        w.write_varchar(0, &state.message);
+        state.next = 1;
+        chunk.set_size(1);
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Table function: ivf_hybrid_search — FTS BM25 + IVF vector, RRF-fused.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct HybridBind {
+    name: String,
+    table: String,
+    id_col: String,
+    text_col: String,
+    query: String,
+    query_table: String,
+    query_col: String,
+    top_k: i64,
+    per_path: i64,
+    nprobe: i64,
+    k_rrf: i64,
+}
+
+struct HybridRow {
+    id: i64,
+    rrf: f64,
+    bm25_rank: i64,
+    vec_rank: i64,
+}
+
+struct HybridState {
+    rows: Vec<HybridRow>,
+    next: usize,
+}
+
+fn do_hybrid(b: &HybridBind) -> Result<Vec<HybridRow>, String> {
+    // Vector path: read the query vector from the single-row table, then ivf_search.
+    let vec_hits: Vec<(i64, usize)> = {
+        let query = {
+            let sess = session().map_err(|e| e.message().to_string())?;
+            read_query_vector(&sess, &b.query_table, &b.query_col)
+        }?;
+        let guard = INDEXES.lock().unwrap();
+        let idx = guard
+            .get(&b.name)
+            .ok_or_else(|| format!("no ivf index named '{}' — call ivf_create_index or ivf_load first", b.name))?;
+        if idx.ivf.dim != query.len() {
+            return Err(format!("query dim {} != index dim {}", query.len(), idx.ivf.dim));
+        }
+        let nprobe = if b.nprobe <= 0 { idx.ivf.nlist } else { b.nprobe as usize };
+        idx.ivf
+            .search(&query, b.per_path as usize, nprobe)
+            .into_iter()
+            .enumerate()
+            .map(|(r, (dense, _))| (idx.ids[dense], r))
+            .collect()
+    };
+    // Text path: FTS layered BM25 on the table's text column.
+    let q_lit = format!("'{}'", b.query.replace('\'', "''"));
+    let fts_sql = format!(
+        "SELECT docname::BIGINT AS id, rank FROM fts_main_{}.search_layered_bm25({}, top_k := {})",
+        b.table, q_lit, b.per_path
+    );
+    let fts_hits: Vec<(i64, usize)> = {
+        let sess = session().map_err(|e| e.message().to_string())?;
+        let mut res = sess
+            .con
+            .query(&fts_sql)
+            .map_err(|e| format!("ivf_hybrid_search: fts: {e}"))?;
+        let mut out = Vec::new();
+        let mut r = 0usize;
+        loop {
+            match res.next_chunk() {
+                Ok(Some(chunk)) if chunk.size() > 0 => {
+                    let n = chunk.size();
+                    let ir = unsafe { chunk.reader(0) };
+                    for i in 0..n {
+                        out.push((unsafe { ir.read_i64(i) }, r));
+                        r += 1;
+                    }
+                }
+                Ok(Some(_)) | Ok(None) => break,
+                Err(e) => return Err(format!("ivf_hybrid_search: fts: {e}")),
+            }
+        }
+        out
+    };
+    // Reciprocal Rank Fusion (rank is 1-based).
+    let mut rrf: HashMap<i64, f64> = HashMap::new();
+    let mut b25: HashMap<i64, i64> = HashMap::new();
+    let mut vrank: HashMap<i64, i64> = HashMap::new();
+    for (id, r) in &fts_hits {
+        *b25.entry(*id).or_insert(0) += 1;
+        *rrf.entry(*id).or_insert(0.0) += 1.0 / (b.k_rrf as f64 + (*r as f64) + 1.0);
+    }
+    for (id, r) in &vec_hits {
+        let cur = vrank.entry(*id).or_insert(0);
+        *cur += 1;
+        *rrf.entry(*id).or_insert(0.0) += 1.0 / (b.k_rrf as f64 + (*r as f64) + 1.0);
+    }
+    let mut rows: Vec<HybridRow> = rrf
+        .into_iter()
+        .map(|(id, s)| HybridRow {
+            id,
+            rrf: s,
+            bm25_rank: b25.get(&id).copied().unwrap_or(0) as i64,
+            vec_rank: vrank.get(&id).copied().unwrap_or(0) as i64,
+        })
+        .collect();
+    rows.sort_by(|a, b| b.rrf.partial_cmp(&a.rrf).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.id.cmp(&b.id)));
+    rows.truncate(b.top_k as usize);
+    Ok(rows)
+}
+
+quack_rs::table_bind_callback!(hybrid_bind, |info| {
+    unsafe {
+        let bind_info = BindInfo::new(info);
+        let name = bind_info
+            .get_parameter_value(0)
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let table = bind_info
+            .get_parameter_value(1)
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let id_col = bind_info
+            .get_parameter_value(2)
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let text_col = bind_info
+            .get_parameter_value(3)
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let query = bind_info
+            .get_parameter_value(4)
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let query_table = bind_info
+            .get_parameter_value(5)
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let query_col = bind_info
+            .get_parameter_value(6)
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if name.is_empty() || table.is_empty() || text_col.is_empty() || query_table.is_empty() {
+            bind_info.set_error(
+                "ivf_hybrid_search: name, table, text_col, query_table are required",
+            );
+            return;
+        }
+        for (lbl, s) in [
+            ("table", &table),
+            ("text_col", &text_col),
+            ("query_table", &query_table),
+            ("query_col", &query_col),
+        ] {
+            if !is_safe_identifier(s) {
+                bind_info.set_error(&format!("ivf_hybrid_search: {lbl} must be an identifier"));
+                return;
+            }
+        }
+        if !id_col.is_empty() && !is_safe_identifier(&id_col) {
+            bind_info.set_error("ivf_hybrid_search: id_col must be an identifier or empty");
+            return;
+        }
+        let top_k = bind_info.get_named_parameter_value("top_k").as_i64().unwrap_or(10);
+        let per_path = bind_info.get_named_parameter_value("per_path").as_i64().unwrap_or(50);
+        let nprobe = bind_info.get_named_parameter_value("nprobe").as_i64().unwrap_or(0);
+        let k_rrf = bind_info.get_named_parameter_value("k_rrf").as_i64().unwrap_or(60);
+        // bind-time existence check (index + fts schema) so callers get a clear error.
+        if let Ok(sess) = session() {
+            {
+                let guard = INDEXES.lock().unwrap();
+                if !guard.contains_key(&name) {
+                    bind_info.set_error(&format!(
+                        "no ivf index named '{}' — call ivf_create_index or ivf_load first",
+                        name
+                    ));
+                    return;
+                }
+            }
+            let probe2 = format!("SELECT {} FROM {} LIMIT 0", query_col, query_table);
+            if let Err(e) = sess.con.query(&probe2) {
+                bind_info.set_error(&format!(
+                    "ivf_hybrid_search: cannot read query vector from {query_table}.{query_col}: {e}"
+                ));
+                return;
+            }
+        }
+        bind_info
+            .add_result_column("id", TypeId::BigInt)
+            .add_result_column("score", TypeId::Double)
+            .add_result_column("bm25_rank", TypeId::BigInt)
+            .add_result_column("vec_rank", TypeId::BigInt)
+            .set_cardinality(top_k.max(1) as u64, false);
+        FfiBindData::<HybridBind>::set(
+            info,
+            HybridBind {
+                name,
+                table,
+                id_col,
+                text_col,
+                query,
+                query_table,
+                query_col,
+                top_k,
+                per_path,
+                nprobe,
+                k_rrf,
+            },
+        );
+    }
+});
+
+quack_rs::table_init_callback!(hybrid_init, |info| {
+    unsafe {
+        let init_info = InitInfo::new(info);
+        init_info.set_max_threads(1);
+        let Some(bind) = FfiBindData::<HybridBind>::get_from_init(info) else {
+            FfiInitData::<HybridState>::set(
+                info,
+                HybridState {
+                    rows: Vec::new(),
+                    next: 0,
+                },
+            );
+            return;
+        };
+        match do_hybrid(&bind) {
+            Ok(rows) => {
+                FfiInitData::<HybridState>::set(
+                    info,
+                    HybridState {
+                        rows,
+                        next: 0,
+                    },
+                );
+            }
+            Err(e) => {
+                init_info.set_error(&e);
+                FfiInitData::<HybridState>::set(
+                    info,
+                    HybridState {
+                        rows: Vec::new(),
+                        next: 0,
+                    },
+                );
+            }
+        }
+    }
+});
+
+quack_rs::table_scan_callback!(hybrid_scan, |info, output| {
+    unsafe {
+        let chunk = DataChunk::from_raw(output);
+        let Some(state) = FfiInitData::<HybridState>::get_mut(info) else {
+            chunk.set_size(0);
+            return;
+        };
+        if state.next >= state.rows.len() {
+            chunk.set_size(0);
+            return;
+        }
+        let batch = (state.rows.len() - state.next).min(duckdb_vector_size() as usize);
+        for i in 0..batch {
+            let r = &state.rows[state.next + i];
+            let mut w = chunk.writer(0);
+            w.write_i64(i, r.id);
+            let mut w = chunk.writer(1);
+            w.write_f64(i, r.rrf);
+            let mut w = chunk.writer(2);
+            w.write_i64(i, r.bm25_rank);
+            let mut w = chunk.writer(3);
+            w.write_i64(i, r.vec_rank);
+        }
+        state.next += batch;
+        chunk.set_size(batch);
+    }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Scalar: ivf_version()
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -715,6 +1293,42 @@ unsafe fn register_all(con: &Connection) -> Result<(), ExtensionError> {
             .bind(ivf_list_bind)
             .init(ivf_list_init)
             .scan(ivf_list_scan),
+    )?;
+
+    con.register_table(
+        TableFunctionBuilder::new("ivf_save")
+            .param(TypeId::Varchar)
+            .param(TypeId::Varchar)
+            .bind(save_bind)
+            .init(save_init)
+            .scan(save_scan),
+    )?;
+
+    con.register_table(
+        TableFunctionBuilder::new("ivf_load")
+            .param(TypeId::Varchar)
+            .param(TypeId::Varchar)
+            .bind(load_bind)
+            .init(load_init)
+            .scan(load_scan),
+    )?;
+
+    con.register_table(
+        TableFunctionBuilder::new("ivf_hybrid_search")
+            .param(TypeId::Varchar)
+            .param(TypeId::Varchar)
+            .param(TypeId::Varchar)
+            .param(TypeId::Varchar)
+            .param(TypeId::Varchar)
+            .param(TypeId::Varchar)
+            .param(TypeId::Varchar)
+            .named_param("top_k", TypeId::BigInt)
+            .named_param("per_path", TypeId::BigInt)
+            .named_param("nprobe", TypeId::BigInt)
+            .named_param("k_rrf", TypeId::BigInt)
+            .bind(hybrid_bind)
+            .init(hybrid_init)
+            .scan(hybrid_scan),
     )?;
 
     con.register_scalar(
