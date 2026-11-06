@@ -180,6 +180,26 @@ loadables). No manual footer hack needed. Then
   performance question a single-threaded skeleton isn't positioned to answer. The claim is:
   the *tunable (speed, recall) knob* exists in-DB, and core has no equivalent.
 
+## E2E nDCG@10 (hybrid vs ANN, 20 queries)
+
+`ztg_poc/ndcg_e2e.py` / `ndcg_real.py` — full-stack ranking quality on 20 query
+phrases, ground truth = exact scoring (vector: `ivf_search_exact` brute force;
+hybrid: RRF of exact-vector top-50 + FTS BM25 top-50). Under test: ANN
+nprobe=8 / hybrid RRF nprobe=8.
+
+| Query vectors | ANN (nprobe=8) | Hybrid (RRF) |
+|---|---:|---:|
+| Constructed (mean of BM25 top-5 doc embeddings) | 0.9337 | 0.9543 |
+| **Real bge-m3 phrase embeddings** (LAN service) | **0.8491** | **0.8720** |
+
+The real-embedding row is the honest one: constructed query vectors are derived
+from the corpus itself, so they align with the index (optimistic). With true
+query phrases, IVF nprobe=8's approximation error shows (0.85, with the worst
+single query at 0.15), and — the point of the hybrid design — **hybrid beats
+pure ANN on real queries** (0.87 vs 0.85; 13/20 queries ≥ ANN), e.g.
+`corporate merger deal` where ANN nDCG is 0.152 but the BM25 arm lifts the
+fusion to 0.417.
+
 ## Typo tolerance + synonyms (Meilisearch-style, on top of `fts`)
 
 `ivf_levenshtein(a, b[, maxd])` — scalar, **OSA Damerau-Levenshtein** (an
@@ -256,5 +276,7 @@ pure constant-foldable scalar. It is now a table function.)
 - `src/lib.rs` — quack-rs C-API binding: 9 table/scalar functions (create/search/
   search_exact/hybrid_search/hybrid_embed/save/load/list/version), session connection,
   LIST reader, RRF fusion.
-- `test_e2e.py` — acceptance test on real ag_news bge-m3 embeddings.
+- `test_e2e.py` — acceptance test on real ag_news bge-m3 embeddings
+  (recall@k, nprobe sweep, e2e nDCG@10 via `ztg_poc/ndcg_e2e.py`,
+  real-query-vector variant in `ztg_poc/ndcg_real.py`).
 - `Makefile`, `Cargo.toml` — C-API extension build (tiktoken skeleton, zero new deps).
