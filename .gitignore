@@ -5,3 +5,8 @@ configure/
 *.so
 *.dylib
 e2e_final.out
+poc/data/
+poc/model/
+poc/*.duckdb_extension
+poc/libml.so
+poc/__pycache__/

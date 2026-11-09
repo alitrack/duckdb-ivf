@@ -8,15 +8,15 @@ import numpy as np
 import duckdb
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SO = "/home/lhy/ivf-target/release/libivf.so"
-NPZ = "/mnt/d/wsl2/tmp/fts_ivf_poc/emb_bge_m3.npz"
-PARQUET = "/mnt/d/wsl2/ag_news_data/ag_news_train.parquet"
+SO = os.environ.get("IVF_SO", os.path.join(HERE, "build", "release", "libivf.so"))
+NPZ = os.environ.get("ZTG_EMB_NPZ", os.path.join(HERE, "poc", "data", "emb_bge_m3.npz"))
+PARQUET = os.environ.get("ZTG_CORPUS", os.path.join(HERE, "poc", "data", "ag_news_train.parquet"))
 
 con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
 # DuckDB 2.0 requires loadables named *.duckdb_extension with a 512-byte metadata
 # footer. Stamp it on the C-API .so (C_STRUCT ABI, C-API-min v1.2.0, linux_amd64,
 # magic "4") — same layout tiktoken's build produces.
-EXT = "/home/lhy/ivf-target/release/ivf.duckdb_extension"
+EXT = os.environ.get("IVF_EXT", os.path.join(HERE, "build", "release", "ivf.duckdb_extension"))
 def stamp(src, dst, ext_ver="v0.1.0", db_ver="v1.2.0", plat="linux_amd64"):
     data = open(src, "rb").read()
     if data[-512:-480].split(b"\x00")[0] == b"4":  # already stamped
