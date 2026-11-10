@@ -143,6 +143,25 @@ Quotes in the embedded expression are built with `chr(39)` because `''`
 escapes are swallowed inside table-function macros. Known limitation: query
 text containing `'` does not round-trip.
 
+### Chinese (中文)
+
+Verified end-to-end (400-doc Chinese corpus, 8 topics):
+
+- **Native fts tokenizer is character-level for CJK** — `原油价格上涨`
+  tokenizes to `原|油|价|格|上|涨`. It "works" (returns hits) but without word
+  semantics, so BM25 ranking quality degrades.
+- **Fix: jieba pre-tokenization** (one lib in
+  `alitrack/duckdb-luajit-libs`, `luajit_module(mode:='install', sql_name:='jieba')`):
+  index the tokenized column and run every query through the same pass
+  (`jieba('北京大学在北京市') → 北京大学|在|北京市`). With jieba in the fts
+  arm, the full hybrid (jieba-BM25 + in-process vector, RRF) returns
+  topic-correct top-5 on Chinese queries — verified with 4 topic queries,
+  3–4/5 correct each.
+- The **vector arm is language-agnostic only as far as the model is**:
+  MiniLM (English) is weak on Chinese; a Chinese-capable embedding model
+  (e.g. bge-m3, which is multilingual) is the right choice for the vector arm
+  of a Chinese deployment. Tokenizer fix + model choice are the two knobs.
+
 ### Important: the session connection
 
 A C-API extension **cannot see the caller's connection**. `duckdb-ivf` opens its own

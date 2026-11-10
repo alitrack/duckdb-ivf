@@ -47,6 +47,18 @@ SELECT * FROM ivf_load('newsm', '/abs/path/to/news.idx');
 
 -- ── 5. FTS index (EDIT: table / id / text columns).
 --      Skip if the index already exists in a persistent database file. ───────
+-- CHINESE: the native standard tokenizer splits CJK at CHARACTER level
+-- (verified: '原油价格上涨' -> 原|油|价|格|上|涨) — it "works" but with no
+-- word semantics, so BM25 quality degrades. For Chinese corpora, tokenize
+-- with jieba first (duckdb-luajit-libs: luajit_module(mode:='install',
+-- sql_name:='jieba')), index the tokenized column, and run queries through
+-- the same tokenization:
+--   jieba('北京大学在北京市') -> ['北京大学','在','北京市']
+--   CREATE TABLE zh_j AS SELECT id, text,
+--       luajit_s('jieba', {v: text, op:'join', sep:' '}) AS toks FROM zh;
+--   PRAGMA create_fts_index('zh_j','id','toks', layered_search=true);
+--   -- query: luajit_s('jieba', {v: '原油价格上涨', op:'join', sep:' '})
+--   --       -> '原油价格 上涨'  (word-level BM25, verified end-to-end)
 PRAGMA create_fts_index('news', 'id', 'text',
   stemmer='porter', stopwords='english', layered_search=true);
 
